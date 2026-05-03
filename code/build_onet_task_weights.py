@@ -213,8 +213,11 @@ def main():
         "n_tasks": int(out["task_id"].nunique()),
         "core_only": bool(args.core_only),
     }
+    
+    diag_dir = Path(str(out_dir) + "_diagnostics")
+    diag_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(out_dir / "_metadata.json", "w") as f:
+    with open(diag_dir / "metadata.json", "w") as f:
         import json
         json.dump(meta, f, indent=2, sort_keys=True)
 
