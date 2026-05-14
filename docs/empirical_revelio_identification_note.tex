@@ -1,0 +1,140 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{enumitem}
+
+\title{Revelio Event-Study Identification Note}
+\author{}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section*{Question}
+
+The empirical question is whether adoption of people analytics or related prediction technology changes firm personnel decisions and workforce composition. The first-pass design treats adoption as a firm-level event and measures dynamic outcomes before and after adoption.
+
+\section*{Treatment}
+
+The main treatment is:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{first\_people\_analytics\_firm\_year\_any\_enriched}
+\end{itemize}
+
+This is the preferred adoption year because it combines position-side and posting-side evidence. Two robustness treatments are also estimated:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{first\_people\_analytics\_position\_year\_any\_enriched}
+    \item \texttt{first\_people\_analytics\_posting\_year\_any\_enriched}
+\end{itemize}
+
+The position treatment is useful because it has longer coverage. The posting treatment is useful because it is closer to active recruiting behavior, but it should only be used in the modern window where posting support is nontrivial.
+
+\section*{Outcomes}
+
+The first-pass outcomes prioritize margins that should move most directly if firms gain better prediction or monitoring technology:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item exit and hire rates
+    \item workforce size and workforce growth
+    \item seniority
+    \item occupational composition
+    \item skill composition
+\end{itemize}
+
+Wages are estimated as secondary outcomes, but they are not the central mechanism in this first pass.
+
+\section*{Identification Logic}
+
+The baseline specification is a dynamic event study with firm fixed effects and year fixed effects. Relative to the omitted period $t=-1$, the coefficients trace how outcomes evolve around adoption.
+
+The identifying comparison is:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item within-firm changes around adoption
+    \item net of common aggregate year shocks
+    \item using never-treated firms and not-yet-treated firms as controls
+\end{itemize}
+
+This is intentionally a transparent first pass rather than the final design. It is useful for showing timing, scale, and whether the main action appears on flows and composition rather than wages.
+
+\section*{Why the Window Is Restricted}
+
+The panel appears to have long early tails, thin posting coverage in earlier years, and obvious artifact years at the end. For that reason, the code does not estimate on the raw full horizon mechanically. Instead it first inspects:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item row counts by year
+    \item distinct firms by year
+    \item position coverage by year
+    \item posting coverage by year
+    \item adoption counts by year
+\end{itemize}
+
+Using the diagnostics already provided, the seeded default window is:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item main and position treatments: 2010--2022
+    \item posting treatment: 2017--2022
+\end{itemize}
+
+This reflects three considerations:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item posting-based adoption is essentially absent before the mid-2010s,
+    \item 2024 and later are clear tail artifacts,
+    \item 2023 looks unstable relative to the preceding years and should be treated cautiously unless the live inspection step supports keeping it.
+\end{enumerate}
+
+\section*{Sample Restrictions}
+
+The event-study sample applies conservative restrictions:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item drop missing \texttt{firm\_key} or \texttt{year}
+    \item trim to supported estimation years
+    \item require enough pre-period and post-period observations for treated firms
+    \item exclude treated cohorts that enter the estimation window too early to provide pre-trends
+    \item keep late-treated firms as controls before their own adoption
+    \item choose the event-time window based on actual support in treated bins
+\end{itemize}
+
+These restrictions are written to disk so the final sample is auditable.
+
+\section*{Specifications}
+
+The implemented baseline specifications are:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item firm FE + year FE
+    \item firm FE + year FE + NAICS2-by-year effects
+    \item firm FE + year FE on firm-years with both position and posting support
+    \item separate position-based and posting-based treatment definitions
+\end{enumerate}
+
+The point of Spec 2 is to absorb sector-specific annual shocks. The point of Spec 3 is to ensure the main result is not being driven by asymmetric source coverage. The point of Spec 4 is to show whether the results are robust to how adoption is dated.
+
+\section*{Beyond Plain TWFE}
+
+The pipeline also includes an advanced design using a Sun-Abraham event study through \texttt{fixest::sunab(...)} when requested and when the R dependencies are available. That design is meant to reduce concerns about treatment-effect heterogeneity across cohorts.
+
+\section*{How to Read the Results}
+
+For the economic mechanism to look credible in the first pass, I would expect:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item more visible movement in hiring, exits, and composition than in wages,
+    \item limited pre-trends in the main outcomes,
+    \item broadly similar timing across the main and position-based treatments,
+    \item posting-based treatment effects concentrated in the later supported window.
+\end{itemize}
+
+\section*{Bottom Line}
+
+The pipeline is set up as a conservative, research-safe first pass: use the combined firm-level adoption year as the main event, estimate dynamic effects on flows and composition first, restrict to years with credible support, and treat richer estimators and heterogeneity as structured extensions rather than ad hoc add-ons.
+
+\end{document}

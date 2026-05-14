@@ -1,0 +1,82 @@
+{
+  "dataset_relative_path": "processed/final/firm_year_panel",
+  "inspection_defaults": {
+    "min_valid_year": 1990,
+    "max_future_year_buffer": 0,
+    "min_rows_share_of_peak": 0.4,
+    "min_firms_share_of_peak": 0.4,
+    "min_position_share_of_peak": 0.4,
+    "min_posting_share_of_peak": 0.15,
+    "min_posting_rows": 50000,
+    "anomalous_end_year_drop_threshold": 0.45,
+    "anomalous_end_year_spike_threshold": 1.4,
+    "anomalous_end_year_adoption_drop_threshold": 0.4,
+    "tail_year_min_rows": 1000,
+    "default_main_start_year": 2010,
+    "default_main_end_year": 2022,
+    "default_posting_start_year": 2017
+  },
+  "event_time_defaults": {
+    "candidate_windows": [5, 4, 3, 2],
+    "default_window": 5,
+    "min_pre_periods": 3,
+    "min_post_periods": 2,
+    "min_event_bin_treated_firms": 250,
+    "min_event_bin_rows": 1000
+  },
+  "winsorization": [
+    {"column": "avg_salary", "lower": 0.01, "upper": 0.99},
+    {"column": "avg_start_salary", "lower": 0.01, "upper": 0.99},
+    {"column": "avg_end_salary", "lower": 0.01, "upper": 0.99},
+    {"column": "posting_count", "lower": 0.0, "upper": 0.99},
+    {"column": "avg_posting_salary", "lower": 0.01, "upper": 0.99},
+    {"column": "workforce_weighted", "lower": 0.01, "upper": 0.99}
+  ],
+  "treatments": [
+    {
+      "name": "main",
+      "label": "Firm-level adoption",
+      "first_treat_col": "first_people_analytics_firm_year_any_enriched",
+      "first_indicator_col": "is_first_people_analytics_firm_year_any_enriched"
+    },
+    {
+      "name": "position",
+      "label": "Position-based adoption",
+      "first_treat_col": "first_people_analytics_position_year_any_enriched",
+      "first_indicator_col": "is_first_people_analytics_position_year_any_enriched"
+    },
+    {
+      "name": "posting",
+      "label": "Posting-based adoption",
+      "first_treat_col": "first_people_analytics_posting_year_any_enriched",
+      "first_indicator_col": "is_first_people_analytics_posting_year_any_enriched"
+    }
+  ],
+  "outcomes": [
+    {"name": "exit_rate", "group": "primary", "label": "Exit rate", "priority": 1},
+    {"name": "hire_rate", "group": "primary", "label": "Hire rate", "priority": 2},
+    {"name": "log_workforce", "group": "primary", "label": "Log workforce", "priority": 3},
+    {"name": "workforce_growth", "group": "primary", "label": "Workforce growth", "priority": 4},
+    {"name": "avg_seniority", "group": "primary", "label": "Average seniority", "priority": 5},
+    {"name": "data_analytics_role_share", "group": "composition", "label": "Data analytics role share", "priority": 6},
+    {"name": "hr_people_role_share", "group": "composition", "label": "HR or people role share", "priority": 7},
+    {"name": "workers_with_hr_technology_skill_share", "group": "composition", "label": "HR technology skill share", "priority": 8},
+    {"name": "workers_with_employee_feedback_tool_skill_share", "group": "composition", "label": "Employee feedback tool skill share", "priority": 9},
+    {"name": "avg_salary", "group": "wages", "label": "Average salary", "priority": 10},
+    {"name": "avg_start_salary", "group": "wages", "label": "Average starting salary", "priority": 11},
+    {"name": "avg_end_salary", "group": "wages", "label": "Average ending salary", "priority": 12},
+    {"name": "posting_count", "group": "secondary", "label": "Posting count", "priority": 13},
+    {"name": "log_posting_count", "group": "secondary", "label": "Log posting count", "priority": 14},
+    {"name": "avg_posting_salary", "group": "secondary", "label": "Average posting salary", "priority": 15},
+    {"name": "people_analytics_positions_any_enriched_share", "group": "secondary", "label": "People analytics position share", "priority": 16},
+    {"name": "people_analytics_postings_any_enriched_share", "group": "secondary", "label": "People analytics posting share", "priority": 17}
+  ],
+  "heterogeneity": [
+    {"name": "public", "column": "hetero_public"},
+    {"name": "private", "column": "hetero_private"},
+    {"name": "large", "column": "hetero_large"},
+    {"name": "small", "column": "hetero_small"},
+    {"name": "data_intensive", "column": "hetero_data_intensive"},
+    {"name": "less_data_intensive", "column": "hetero_less_data_intensive"}
+  ]
+}

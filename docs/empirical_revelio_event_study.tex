@@ -1,0 +1,226 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\title{Revelio Event-Study Strategy Note}
+\author{}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Purpose}
+
+This note summarizes the first-pass empirical pipeline for firm-level adoption of people analytics or prediction technology in the Revelio firm-year panel. The starting panel is:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{/labs/khanna/predictive\_capital/revelio\_people\_analytics/processed/final/firm\_year\_panel}
+\end{itemize}
+
+The code is organized as standalone command-line scripts with explicit paths, Spark-based data preparation, cluster-safe batch wrappers, and a separate estimation backend in \texttt{R/fixest} for high-dimensional fixed effects.
+
+\section{Treatment Definitions}
+
+The pipeline estimates three treatment definitions.
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Main firm-level adoption:} \texttt{first\_people\_analytics\_firm\_year\_any\_enriched}. This is the preferred treatment because it combines position-side and posting-side adoption signals.
+    \item \textbf{Position-based adoption:} \texttt{first\_people\_analytics\_position\_year\_any\_enriched}. This is the long-run backbone robustness measure because position coverage extends further back.
+    \item \textbf{Posting-based adoption:} \texttt{first\_people\_analytics\_posting\_year\_any\_enriched}. This is a modern-window robustness measure for years with meaningful posting support.
+\end{enumerate}
+
+For each treatment, the sample builder creates:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item event time
+    \item ever treated
+    \item never treated
+    \item not-yet-treated
+    \item post
+    \item balanced-treated indicators
+    \item treatment-specific analysis-row flags
+    \item treatment-specific binned event times based on observed support
+\end{itemize}
+
+\section{Economic Focus and Outcomes}
+
+The empirical design prioritizes margins that should respond most directly if better prediction or monitoring technology changes firms' private information and personnel decisions.
+
+\subsection*{Primary outcomes}
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{exit\_rate}
+    \item \texttt{hire\_rate}
+    \item \texttt{log\_workforce}
+    \item \texttt{workforce\_growth}
+    \item \texttt{avg\_seniority}
+    \item \texttt{data\_analytics\_role\_share}
+    \item \texttt{hr\_people\_role\_share}
+    \item \texttt{workers\_with\_hr\_technology\_skill\_share}
+    \item \texttt{workers\_with\_employee\_feedback\_tool\_skill\_share}
+\end{itemize}
+
+\subsection*{Secondary outcomes}
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{avg\_salary}
+    \item \texttt{avg\_start\_salary}
+    \item \texttt{avg\_end\_salary}
+    \item \texttt{posting\_count}
+    \item \texttt{log\_posting\_count}
+    \item \texttt{avg\_posting\_salary}
+    \item \texttt{people\_analytics\_positions\_any\_enriched\_share}
+    \item \texttt{people\_analytics\_postings\_any\_enriched\_share}
+\end{itemize}
+
+Wages are estimated, but they are treated as secondary because the first-pass mechanism emphasizes personnel decisions, composition, and organizational change more than pay.
+
+\section{Sample Restrictions}
+
+The code does not assume one fixed sample in advance. It first inspects the panel, writes year-level diagnostics, and then recommends a supported estimation window. The seeded defaults from the diagnostics provided so far are:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item main and position treatment windows: 2010--2022
+    \item posting treatment window: 2017--2022
+\end{itemize}
+
+These defaults are meant to be overridden by the inspection step if the live panel implies a better window.
+
+\subsection*{Restriction logic}
+
+\begin{itemize}[leftmargin=1.5em]
+    \item drop rows with missing \texttt{firm\_key} or \texttt{year}
+    \item drop invalid year artifacts and trivial tail years
+    \item trim to the common estimation horizon implied by the input inspection step
+    \item require enough pre-period support and post-period support for treated cohorts
+    \item keep late-treated firms as controls prior to their own treatment
+    \item exclude already-treated cohorts that enter the trimmed window without enough pre-period observations
+    \item choose the event-study bin width from a candidate set based on actual treated support in each event-time cell
+    \item keep a stronger both-sources sample for one robustness specification
+\end{itemize}
+
+Each restriction step is saved to disk rather than being applied silently.
+
+\section{Derived Variables}
+
+The sample builder creates:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{log\_workforce}
+    \item \texttt{workforce\_growth}
+    \item \texttt{log\_posting\_count}
+    \item winsorized versions of the main skewed level variables
+    \item \texttt{naics2} industry groups for more saturated industry-year controls
+    \item heterogeneity splits for public/private, large/small, and data-intensive/less-data-intensive firms
+\end{itemize}
+
+\section{Estimation Strategy}
+
+\subsection*{Baseline event studies}
+
+The first-pass estimator is a transparent dynamic TWFE event study with:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item firm fixed effects
+    \item year fixed effects
+    \item omitted event time equal to $-1$
+    \item firm-level clustered standard errors
+\end{itemize}
+
+Implemented baseline specifications:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item firm FE + year FE
+    \item firm FE + year FE + NAICS2-by-year fixed effects
+    \item firm FE + year FE on the sample with both position and posting coverage by year
+    \item separate position-based and posting-based treatment definitions
+\end{enumerate}
+
+\subsection*{Advanced design}
+
+The stronger design is a Sun--Abraham style event study implemented through \texttt{fixest::sunab(...)} for the main treatment and primary outcomes. The code is written so the baseline always runs when \texttt{Rscript} and the required packages are available, while the advanced estimator runs only when explicitly requested.
+
+\section{Heterogeneity}
+
+The sample construction step creates the following heterogeneity flags:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item public versus non-public firms
+    \item large versus small firms using baseline workforce
+    \item data-intensive versus less-data-intensive firms using baseline worker skill intensity
+\end{itemize}
+
+Optional heterogeneity regressions can then be run for the main treatment and the primary outcomes.
+
+\section{Code Flow}
+
+The scripts are intended to run in this order:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \texttt{code/analysis/00\_inspect\_revelio\_event\_study\_inputs.py}
+    \item \texttt{code/analysis/01\_build\_event\_study\_sample.py}
+    \item \texttt{code/analysis/02\_estimate\_event\_studies.py}
+    \item \texttt{code/analysis/03\_make\_event\_study\_figures.py}
+    \item \texttt{code/analysis/04\_make\_summary\_tables.py}
+\end{enumerate}
+
+\section{Main Outputs}
+
+The pipeline writes outputs to:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{processed/analysis/diagnostics/input\_inspection/}
+    \item \texttt{processed/analysis/diagnostics/event\_study\_sample/}
+    \item \texttt{processed/analysis/samples/revelio\_event\_study\_sample.parquet}
+    \item \texttt{processed/analysis/event\_study/results/}
+    \item \texttt{processed/analysis/event\_study/quicklook/}
+    \item \texttt{processed/analysis/event\_study/notes/}
+    \item \texttt{processed/analysis/figures/event\_study/}
+    \item \texttt{processed/analysis/tables/event\_study\_sample/}
+    \item \texttt{processed/analysis/tables/event\_study\_summary/}
+\end{itemize}
+
+\section{How to Run}
+
+You can either submit each step individually, or submit the full dependency chain in one shot.
+
+\subsection*{Submit the full pipeline}
+
+\begin{verbatim}
+bash sbatch/run_full_revelio_event_study_pipeline.sh
+\end{verbatim}
+
+\subsection*{Submit step by step}
+
+\begin{verbatim}
+sbatch sbatch/run_00_inspect_revelio_event_study_inputs.sbatch
+sbatch sbatch/run_01_build_event_study_sample.sbatch
+sbatch sbatch/run_02_estimate_event_studies.sbatch
+sbatch sbatch/run_03_make_event_study_figures.sbatch
+sbatch sbatch/run_04_make_summary_tables.sbatch
+\end{verbatim}
+
+\section{Dependencies and Caveats}
+
+The estimation backend requires \texttt{Rscript} and the following R packages:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{fixest}
+    \item \texttt{data.table}
+    \item \texttt{arrow}
+    \item \texttt{dplyr}
+    \item \texttt{jsonlite}
+\end{itemize}
+
+The code is designed to fail loudly if these are not available.
+
+The main empirical caveat from the provided diagnostics is that the end of the sample appears unstable: 2024 and later are clear tail artifacts, and 2023 should be checked against the live panel inspection output before being used as a main estimation year.
+
+\end{document}
