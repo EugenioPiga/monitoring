@@ -5,511 +5,765 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 from pathlib import Path
+import sys
 
 import pandas as pd
+from pyspark.sql import DataFrame, functions as F
 
 SCRIPT_PATH = Path(__file__).resolve()
 PROJECT_ROOT = SCRIPT_PATH.parents[2]
 CODE_ROOT = PROJECT_ROOT / "code"
-
-import sys
-
 if str(CODE_ROOT) not in sys.path:
     sys.path.insert(0, str(CODE_ROOT))
 
-from pyspark.sql import Window
-from pyspark.sql import functions as F
-
-from utils.revelio_analysis_utils import (
+from utils.revelio_analysis_utils import (  # noqa: E402
     append_restriction,
     build_analysis_paths,
     create_spark,
-    default_dataset_path,
+    default_parent_occ_path,
+    default_parent_year_path,
+    default_visibility_panel_path,
     ensure_analysis_directories,
     ensure_directory,
-    extract_naics_digits,
     load_json,
     setup_logging,
     write_json,
     write_pandas_csv,
     write_restriction_outputs,
 )
-from utils.revelio_event_study_design import choose_supported_event_window, recommend_windows, treatment_frame
+from utils.revelio_event_study_design import (  # noqa: E402
+    build_joint_year_frame,
+    configured_visibility_variables,
+    event_dummy_name,
+    event_time_values,
+    optional_outcomes,
+    recommend_estimation_window,
+    required_outcomes,
+    safe_visibility_name,
+    visibility_enabled,
+    visibility_interaction_name,
+)
 
 
-BASELINE_DATA_INTENSITY_COMPONENTS = [
-    "workers_with_data_skill_share",
-    "avg_predicted_skill_share",
+JOIN_TREATMENT_COLUMNS = [
+    "first_people_analytics_posting_year_any_enriched",
+    "is_first_people_analytics_posting_year_any_enriched",
+    "has_people_analytics_posting_any_enriched_by_year",
 ]
+
+KEY_COLUMNS = ["parent_rcid", "occupation", "year"]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build the Revelio event-study estimation sample.")
+    parser = argparse.ArgumentParser(description="Build safe-v3 parent-occupation event-study samples.")
     parser.add_argument("--project-root", default=str(PROJECT_ROOT))
-    parser.add_argument("--dataset-path", default=None)
+    parser.add_argument("--parent-year-dir", default=None)
+    parser.add_argument("--parent-occ-dir", default=None)
+    parser.add_argument("--visibility-panel-dir", default=None)
     parser.add_argument("--inspection-dir", default=None)
-    parser.add_argument("--output-dir", default=None, help="Directory for the sample parquet.")
+    parser.add_argument("--output-dir", default=None, help="Directory where base sample parquet outputs will be written.")
+    parser.add_argument("--visibility-output-dir", default=None, help="Directory where visibility sample parquet outputs will be written.")
     parser.add_argument("--config-path", default=str(PROJECT_ROOT / "configs" / "revelio_event_study_config.json"))
-    parser.add_argument("--shuffle-partitions", type=int, default=600)
-    parser.add_argument("--coalesce", type=int, default=120)
+    parser.add_argument("--shuffle-partitions", type=int, default=1200)
+    parser.add_argument("--coalesce", type=int, default=300)
     parser.add_argument("--tmpdir", default=None)
-    parser.add_argument("--min-pre-periods", type=int, default=None)
-    parser.add_argument("--min-post-periods", type=int, default=None)
     return parser.parse_args()
 
 
-def build_year_summary(df) -> pd.DataFrame:
-    ordered = (
-        df.groupBy("year")
-        .agg(
-            F.count(F.lit(1)).alias("row_count"),
-            F.countDistinct("firm_key").alias("distinct_firms"),
-            F.sum(F.when(F.col("has_position_data") == 1, 1).otherwise(0)).alias("position_rows"),
-            F.sum(F.when(F.col("has_posting_data") == 1, 1).otherwise(0)).alias("posting_rows"),
-            F.sum(F.when(F.col("is_first_people_analytics_firm_year_any_enriched") == 1, 1).otherwise(0)).alias("main_adoptions"),
-            F.sum(F.when(F.col("is_first_people_analytics_position_year_any_enriched") == 1, 1).otherwise(0)).alias("position_adoptions"),
-            F.sum(F.when(F.col("is_first_people_analytics_posting_year_any_enriched") == 1, 1).otherwise(0)).alias("posting_adoptions"),
-        )
-        .orderBy(F.col("year").asc_nulls_last())
-    )
-    return ordered.toPandas()
-
-
-def load_windows(df, inspection_dir: Path, config: dict[str, object]) -> dict[str, object]:
-    window_path = inspection_dir / "07_recommended_estimation_windows.json"
-    if window_path.exists():
-        return load_json(window_path)
-    year_summary = build_year_summary(df)
-    recommended = recommend_windows(year_summary, config, current_year=datetime.utcnow().year)
-    return recommended["recommended_windows"]
-
-
-def write_parquet(df, path: Path, coalesce: int) -> None:
+def write_parquet(df: DataFrame, path: Path, coalesce: int) -> None:
     writer = df
     if coalesce > 0:
         writer = writer.coalesce(max(1, coalesce))
     writer.write.mode("overwrite").option("compression", "snappy").parquet(str(path))
 
 
-def add_winsorized_columns(df, winsorization: list[dict[str, object]], logger) -> tuple[object, dict[str, dict[str, float]]]:
-    quantile_map: dict[str, dict[str, float]] = {}
-    for spec in winsorization:
-        column = str(spec["column"])
-        if column not in df.columns:
-            continue
-        lower_prob = float(spec["lower"])
-        upper_prob = float(spec["upper"])
-        quantiles = df.approxQuantile(column, [lower_prob, upper_prob], 0.001)
-        if len(quantiles) != 2:
-            logger.warning("Skipping winsorization for %s because approximate quantiles were unavailable.", column)
-            continue
-        lower_value, upper_value = quantiles
-        quantile_map[column] = {
-            "lower_probability": lower_prob,
-            "upper_probability": upper_prob,
-            "lower_value": float(lower_value),
-            "upper_value": float(upper_value),
-        }
-        winsorized_name = f"{column}_winsor_p{int(round(lower_prob * 100)):02d}_p{int(round(upper_prob * 100)):02d}"
-        logger.info(
-            "Winsorizing %s into %s with bounds [%s, %s]",
-            column,
-            winsorized_name,
-            lower_value,
-            upper_value,
-        )
-        df = df.withColumn(
-            winsorized_name,
-            F.when(
-                F.col(column).isNull(),
-                F.lit(None),
-            ).otherwise(
-                F.least(F.greatest(F.col(column).cast("double"), F.lit(lower_value)), F.lit(upper_value))
-            ),
-        )
-    return df, quantile_map
-
-
-def add_main_heterogeneity_flags(df, global_start_year: int):
-    main_treat_col = "first_people_analytics_firm_year_any_enriched"
-    df = df.withColumn(
-        "main_event_time_raw",
-        F.when(F.col(main_treat_col).isNotNull(), F.col("year") - F.col(main_treat_col)).otherwise(F.lit(None)),
-    )
-    data_intensity_components = [F.coalesce(F.col(column), F.lit(0.0)) for column in BASELINE_DATA_INTENSITY_COMPONENTS if column in df.columns]
-    if data_intensity_components:
-        data_intensity_expr = data_intensity_components[0]
-        for component in data_intensity_components[1:]:
-            data_intensity_expr = data_intensity_expr + component
-        data_intensity_expr = data_intensity_expr / F.lit(float(len(data_intensity_components)))
-    else:
-        data_intensity_expr = F.lit(None)
-    df = df.withColumn("baseline_data_intensity_source", data_intensity_expr)
-
-    baseline_selector = (
-        (F.col(main_treat_col).isNotNull() & F.col("main_event_time_raw").between(-3, -1))
-        | (F.col(main_treat_col).isNull() & F.col("year").between(global_start_year, global_start_year + 2))
-        | (F.col(main_treat_col).isNotNull() & (F.col(main_treat_col) > global_start_year + 2) & F.col("year").between(global_start_year, global_start_year + 2))
-    )
-    baseline_frame = (
-        df.where(baseline_selector)
-        .groupBy("firm_key")
-        .agg(
-            F.avg("workforce_weighted").alias("baseline_workforce_main"),
-            F.avg("baseline_data_intensity_source").alias("baseline_data_intensity_main"),
-            F.max(F.when((F.col("has_position_data") == 1) & (F.col("has_posting_data") == 1), 1).otherwise(0)).alias("firm_has_both_data_any_year"),
-            F.max("is_public_company").alias("baseline_is_public_company"),
-        )
-    )
-
-    medians = baseline_frame.select("baseline_workforce_main", "baseline_data_intensity_main").toPandas()
-    size_cutoff = float(medians["baseline_workforce_main"].median()) if medians["baseline_workforce_main"].notna().any() else None
-    intensity_cutoff = float(medians["baseline_data_intensity_main"].median()) if medians["baseline_data_intensity_main"].notna().any() else None
-
-    if size_cutoff is None:
-        baseline_frame = baseline_frame.withColumn("hetero_large", F.lit(None)).withColumn("hetero_small", F.lit(None))
-    else:
-        baseline_frame = baseline_frame.withColumn(
-            "hetero_large",
-            F.when(F.col("baseline_workforce_main") >= F.lit(size_cutoff), F.lit(1)).otherwise(F.lit(0)),
-        )
-        baseline_frame = baseline_frame.withColumn(
-            "hetero_small",
-            F.when(F.col("baseline_workforce_main").isNull(), F.lit(None)).when(F.col("hetero_large") == 1, F.lit(0)).otherwise(F.lit(1)),
-        )
-
-    if intensity_cutoff is None:
-        baseline_frame = baseline_frame.withColumn("hetero_data_intensive", F.lit(None)).withColumn("hetero_less_data_intensive", F.lit(None))
-    else:
-        baseline_frame = baseline_frame.withColumn(
-            "hetero_data_intensive",
-            F.when(F.col("baseline_data_intensity_main") >= F.lit(intensity_cutoff), F.lit(1)).otherwise(F.lit(0)),
-        )
-        baseline_frame = baseline_frame.withColumn(
-            "hetero_less_data_intensive",
-            F.when(F.col("baseline_data_intensity_main").isNull(), F.lit(None)).when(F.col("hetero_data_intensive") == 1, F.lit(0)).otherwise(F.lit(1)),
-        )
-    baseline_frame = baseline_frame.withColumn(
-        "hetero_public",
-        F.when(F.col("baseline_is_public_company") == 1, F.lit(1))
-        .when(F.col("baseline_is_public_company").isNull(), F.lit(None))
-        .otherwise(F.lit(0)),
-    )
-    baseline_frame = baseline_frame.withColumn(
-        "hetero_private",
-        F.when(F.col("baseline_is_public_company") == 0, F.lit(1))
-        .when(F.col("baseline_is_public_company").isNull(), F.lit(None))
-        .otherwise(F.lit(0)),
-    )
-
-    return df.join(baseline_frame, on="firm_key", how="left"), {
-        "size_cutoff": size_cutoff,
-        "data_intensity_cutoff": intensity_cutoff,
-    }
-
-
-def add_treatment_design_columns(
-    df,
+def load_window(
     *,
-    treatment_name: str,
-    first_treat_col: str,
-    start_year: int,
-    end_year: int,
-    min_pre_periods: int,
-    min_post_periods: int,
-):
-    firm_window = Window.partitionBy("firm_key")
-    prefix = treatment_name
-
-    df = df.withColumn(f"{prefix}_analysis_year", F.col("year").between(start_year, end_year).cast("int"))
-    df = df.withColumn(f"{prefix}_event_time_raw", F.when(F.col(first_treat_col).isNotNull(), F.col("year") - F.col(first_treat_col)).otherwise(F.lit(None)))
-    df = df.withColumn(f"{prefix}_ever_treated", F.when(F.col(first_treat_col).isNotNull(), F.lit(1)).otherwise(F.lit(0)))
-    df = df.withColumn(f"{prefix}_never_treated", F.when(F.col(first_treat_col).isNull(), F.lit(1)).otherwise(F.lit(0)))
-    df = df.withColumn(
-        f"{prefix}_not_yet_treated",
-        F.when(F.col(first_treat_col).isNotNull() & (F.col("year") < F.col(first_treat_col)), F.lit(1)).otherwise(F.lit(0)),
-    )
-    df = df.withColumn(
-        f"{prefix}_post",
-        F.when(F.col(first_treat_col).isNotNull() & (F.col("year") >= F.col(first_treat_col)), F.lit(1)).otherwise(F.lit(0)),
-    )
-
-    earliest_eligible_cohort = start_year + min_pre_periods
-    latest_eligible_cohort = end_year - min_post_periods
-    df = df.withColumn(
-        f"{prefix}_treated_cohort_in_window",
-        F.when(F.col(first_treat_col).between(earliest_eligible_cohort, latest_eligible_cohort), F.lit(1)).otherwise(F.lit(0)),
-    )
-    df = df.withColumn(
-        f"{prefix}_early_treated_excluded",
-        F.when(F.col(first_treat_col).isNotNull() & (F.col(first_treat_col) < earliest_eligible_cohort), F.lit(1)).otherwise(F.lit(0)),
-    )
-    df = df.withColumn(
-        f"{prefix}_late_treated_control",
-        F.when(F.col(first_treat_col).isNotNull() & (F.col(first_treat_col) > latest_eligible_cohort), F.lit(1)).otherwise(F.lit(0)),
-    )
-
-    df = df.withColumn(
-        f"{prefix}_pre_obs_count",
-        F.sum(
-            F.when(
-                F.col("year").between(start_year, end_year) & F.col(first_treat_col).isNotNull() & (F.col("year") < F.col(first_treat_col)),
-                1,
-            ).otherwise(0)
-        ).over(firm_window),
-    )
-    df = df.withColumn(
-        f"{prefix}_post_obs_count",
-        F.sum(
-            F.when(
-                F.col("year").between(start_year, end_year) & F.col(first_treat_col).isNotNull() & (F.col("year") >= F.col(first_treat_col)),
-                1,
-            ).otherwise(0)
-        ).over(firm_window),
-    )
-    df = df.withColumn(
-        f"{prefix}_balanced_treated",
-        F.when(
-            (F.col(f"{prefix}_treated_cohort_in_window") == 1)
-            & (F.col(f"{prefix}_pre_obs_count") >= min_pre_periods)
-            & (F.col(f"{prefix}_post_obs_count") >= min_post_periods),
-            F.lit(1),
-        ).otherwise(F.lit(0)),
-    )
-
-    df = df.withColumn(
-        f"{prefix}_analysis_row",
-        F.when(
-            (F.col("year").between(start_year, end_year))
-            & (
-                (F.col(f"{prefix}_never_treated") == 1)
-                | (F.col(f"{prefix}_balanced_treated") == 1)
-                | ((F.col(f"{prefix}_late_treated_control") == 1) & (F.col("year") < F.col(first_treat_col)))
-            ),
-            F.lit(1),
-        ).otherwise(F.lit(0)),
-    )
-    return df
+    inspection_dir: Path,
+    parent_year_summary: pd.DataFrame,
+    parent_occ_summary: pd.DataFrame,
+    config: dict[str, object],
+) -> dict[str, object]:
+    window_path = inspection_dir / "10_recommended_window.json"
+    if window_path.exists():
+        return load_json(window_path)
+    joined = build_joint_year_frame(parent_year_summary, parent_occ_summary)
+    recommended = recommend_estimation_window(joined, config, current_year=datetime.utcnow().year)
+    return recommended["recommended_window"]
 
 
-def build_event_support(df, treatment_name: str) -> pd.DataFrame:
-    prefix = treatment_name
-    support = (
-        df.where((F.col(f"{prefix}_analysis_row") == 1) & (F.col(f"{prefix}_balanced_treated") == 1))
-        .where(F.col(f"{prefix}_event_time_raw").isNotNull())
-        .where(F.col(f"{prefix}_event_time_raw").between(-8, 8))
-        .groupBy(F.col(f"{prefix}_event_time_raw").alias("event_time"))
+def build_parent_year_summary(df: DataFrame) -> pd.DataFrame:
+    analysis_col = "analysis_sample" if "analysis_sample" in df.columns else None
+    return (
+        df.groupBy("year")
         .agg(
-            F.count(F.lit(1)).alias("treated_rows"),
-            F.countDistinct("firm_key").alias("treated_firms"),
+            F.count(F.lit(1)).alias("parent_year_rows"),
+            F.approx_count_distinct("parent_rcid").alias("parent_year_approx_parents"),
+            F.sum(F.when(F.col("is_first_people_analytics_posting_year_any_enriched") == 1, 1).otherwise(0)).alias("parent_year_adoptions"),
+            (
+                F.sum(F.when(F.col(analysis_col) == 1, 1).otherwise(0)).alias("parent_year_analysis_rows")
+                if analysis_col
+                else F.lit(None).cast("double").alias("parent_year_analysis_rows")
+            ),
         )
-        .orderBy("event_time")
+        .orderBy("year")
         .toPandas()
     )
-    if support.empty:
-        support = pd.DataFrame(columns=["event_time", "treated_rows", "treated_firms"])
-    support["treatment_name"] = treatment_name
-    return support
 
 
-def add_binned_event_time(df, treatment_name: str, supported_window: int):
-    prefix = treatment_name
-    lower = -supported_window
-    upper = supported_window
+def build_parent_occ_summary(df: DataFrame) -> pd.DataFrame:
+    analysis_col = "occupation_analysis_sample" if "occupation_analysis_sample" in df.columns else None
+    return (
+        df.groupBy("year")
+        .agg(
+            F.count(F.lit(1)).alias("parent_occ_rows"),
+            F.approx_count_distinct("parent_rcid").alias("parent_occ_approx_parents"),
+            F.approx_count_distinct("occupation").alias("parent_occ_approx_occupations"),
+            (
+                F.sum(F.when(F.col(analysis_col) == 1, 1).otherwise(0)).alias("parent_occ_analysis_rows")
+                if analysis_col
+                else F.lit(None).cast("double").alias("parent_occ_analysis_rows")
+            ),
+        )
+        .orderBy("year")
+        .toPandas()
+    )
+
+
+def build_parent_treatment(parent_year: DataFrame) -> tuple[DataFrame, DataFrame]:
+    timing = (
+        parent_year.where(F.col("parent_rcid").isNotNull())
+        .groupBy("parent_rcid")
+        .agg(
+            F.min("first_people_analytics_posting_year_any_enriched").alias("first_people_analytics_posting_year_any_enriched"),
+            F.max("is_first_people_analytics_posting_year_any_enriched").alias("any_first_indicator"),
+            F.max("has_people_analytics_posting_any_enriched_by_year").alias("ever_adopted_by_year_flag"),
+            F.countDistinct("first_people_analytics_posting_year_any_enriched").alias("distinct_timing_values"),
+        )
+        .withColumn(
+            "ever_treated",
+            F.when(F.col("first_people_analytics_posting_year_any_enriched").isNotNull(), F.lit(1)).otherwise(F.lit(0)),
+        )
+    )
+    inconsistent = timing.where(F.col("distinct_timing_values") > 1)
+    return timing.drop("any_first_indicator", "ever_adopted_by_year_flag"), inconsistent
+
+
+def add_event_columns(df: DataFrame, config: dict[str, object]) -> DataFrame:
+    bin_min = int(config["event_time"]["bin_min"])
+    bin_max = int(config["event_time"]["bin_max"])
+    omit_event_time = int(config["event_time"]["omit_event_time"])
+    event_values = event_time_values(config, include_omitted=True)
+
     df = df.withColumn(
-        f"{prefix}_event_time_binned",
+        "event_time_raw",
         F.when(
-            F.col(f"{prefix}_event_time_raw").isNull(),
-            F.lit(None),
-        ).otherwise(
-            F.when(F.col(f"{prefix}_event_time_raw") < lower, F.lit(lower))
-            .when(F.col(f"{prefix}_event_time_raw") > upper, F.lit(upper))
-            .otherwise(F.col(f"{prefix}_event_time_raw"))
-        ),
+            F.col("first_people_analytics_posting_year_any_enriched").isNotNull(),
+            F.col("year") - F.col("first_people_analytics_posting_year_any_enriched"),
+        ).otherwise(F.lit(None)),
     )
     df = df.withColumn(
-        f"{prefix}_supported_window",
-        F.when(F.col(f"{prefix}_analysis_row") == 1, F.lit(supported_window)).otherwise(F.lit(None)),
+        "event_time_binned",
+        F.when(F.col("event_time_raw").isNull(), F.lit(None))
+        .when(F.col("event_time_raw") < F.lit(bin_min), F.lit(bin_min))
+        .when(F.col("event_time_raw") > F.lit(bin_max), F.lit(bin_max))
+        .otherwise(F.col("event_time_raw")),
     )
+    df = df.withColumn("never_treated", F.when(F.col("ever_treated") == 1, F.lit(0)).otherwise(F.lit(1)))
+    df = df.withColumn(
+        "not_yet_treated",
+        F.when((F.col("ever_treated") == 1) & (F.col("year") < F.col("first_people_analytics_posting_year_any_enriched")), F.lit(1)).otherwise(F.lit(0)),
+    )
+    df = df.withColumn(
+        "post",
+        F.when((F.col("ever_treated") == 1) & (F.col("year") >= F.col("first_people_analytics_posting_year_any_enriched")), F.lit(1)).otherwise(F.lit(0)),
+    )
+    df = df.withColumn("treated_event_row", F.when(F.col("ever_treated") == 1, F.lit(1)).otherwise(F.lit(0)))
+    for event_time in event_values:
+        dummy_name = event_dummy_name(event_time)
+        df = df.withColumn(
+            dummy_name,
+            F.when(
+                (F.col("treated_event_row") == 1) & (F.col("event_time_binned") == F.lit(event_time)),
+                F.lit(1),
+            ).otherwise(F.lit(0)),
+        )
+    df = df.withColumn("omit_event_time", F.lit(omit_event_time))
     return df
+
+
+def build_support_table(df: DataFrame) -> pd.DataFrame:
+    return (
+        df.where(F.col("treated_event_row") == 1)
+        .groupBy("event_time_binned")
+        .agg(
+            F.count(F.lit(1)).alias("treated_rows"),
+            F.approx_count_distinct("parent_rcid").alias("treated_approx_parents"),
+            F.approx_count_distinct("parent_occ_fe").alias("treated_approx_parent_occ_cells"),
+        )
+        .orderBy("event_time_binned")
+        .toPandas()
+        .rename(columns={"event_time_binned": "event_time"})
+    )
+
+
+def build_cohort_table(df: DataFrame) -> pd.DataFrame:
+    return (
+        df.select("parent_rcid", "first_people_analytics_posting_year_any_enriched")
+        .dropDuplicates(["parent_rcid"])
+        .where(F.col("first_people_analytics_posting_year_any_enriched").isNotNull())
+        .groupBy("first_people_analytics_posting_year_any_enriched")
+        .agg(F.count("*").alias("treated_parents"))
+        .orderBy("first_people_analytics_posting_year_any_enriched")
+        .toPandas()
+        .rename(columns={"first_people_analytics_posting_year_any_enriched": "cohort_year"})
+    )
+
+
+def build_outcome_nonmissing(df: DataFrame, outcomes: list[str]) -> pd.DataFrame:
+    agg_exprs = []
+    for outcome in outcomes:
+        if outcome in df.columns:
+            agg_exprs.append(F.sum(F.when(F.col(outcome).isNotNull(), 1).otherwise(0)).alias(outcome))
+    overall = df.agg(*agg_exprs).toPandas().T.reset_index()
+    overall.columns = ["outcome", "nonmissing_rows"]
+    return overall
+
+
+def build_stacked_sample(base_df: DataFrame, config: dict[str, object], logger) -> tuple[DataFrame | None, pd.DataFrame]:
+    pre_window = int(config["event_time"]["pre_window"])
+    post_window = int(config["event_time"]["post_window"])
+    min_treated = int(config["event_time"]["stack_min_treated_parents"])
+    event_values = event_time_values(config, include_omitted=True)
+
+    cohort_frame = (
+        base_df.select("parent_rcid", "first_people_analytics_posting_year_any_enriched")
+        .dropDuplicates(["parent_rcid"])
+        .where(F.col("first_people_analytics_posting_year_any_enriched").isNotNull())
+        .groupBy("first_people_analytics_posting_year_any_enriched")
+        .agg(F.count("*").alias("treated_parents"))
+        .where(F.col("treated_parents") >= F.lit(min_treated))
+        .orderBy("first_people_analytics_posting_year_any_enriched")
+        .collect()
+    )
+    eligible_cohorts = [int(row["first_people_analytics_posting_year_any_enriched"]) for row in cohort_frame]
+    logger.info("Eligible stacked cohorts: %s", eligible_cohorts)
+    if not eligible_cohorts:
+        return None, pd.DataFrame(columns=["stack_cohort", "treated_parents", "control_parents"])
+
+    stacked_parts = []
+    support_rows: list[dict[str, object]] = []
+    for cohort in eligible_cohorts:
+        subset = (
+            base_df.where(F.col("year").between(cohort - pre_window, cohort + post_window))
+            .where(
+                (F.col("first_people_analytics_posting_year_any_enriched") == F.lit(cohort))
+                | F.col("first_people_analytics_posting_year_any_enriched").isNull()
+                | (F.col("first_people_analytics_posting_year_any_enriched") > F.lit(cohort + post_window))
+            )
+            .withColumn("stack_cohort", F.lit(cohort))
+            .withColumn(
+                "stack_treated",
+                F.when(F.col("first_people_analytics_posting_year_any_enriched") == F.lit(cohort), F.lit(1)).otherwise(F.lit(0)),
+            )
+            .withColumn("stack_event_time_raw", F.col("year") - F.lit(cohort))
+            .withColumn("stack_event_time_binned", F.col("year") - F.lit(cohort))
+            .withColumn("stack_parent_occ_fe", F.concat_ws("::", F.lit(str(cohort)), F.col("parent_occ_fe")))
+            .withColumn("stack_parent_year_fe", F.concat_ws("::", F.lit(str(cohort)), F.col("parent_year_fe")))
+            .withColumn("stack_occupation_year_fe", F.concat_ws("::", F.lit(str(cohort)), F.col("occupation_year_fe")))
+        )
+        for event_time in event_values:
+            subset = subset.withColumn(
+                event_dummy_name(event_time, prefix="stack_event"),
+                F.when(
+                    (F.col("stack_treated") == 1) & (F.col("stack_event_time_binned") == F.lit(event_time)),
+                    F.lit(1),
+                ).otherwise(F.lit(0)),
+            )
+        stacked_parts.append(subset)
+        counts = (
+            subset.groupBy("stack_treated")
+            .agg(F.approx_count_distinct("parent_rcid").alias("approx_parents"))
+            .toPandas()
+        )
+        treated_count = int(counts.loc[counts["stack_treated"] == 1, "approx_parents"].sum()) if not counts.empty else 0
+        control_count = int(counts.loc[counts["stack_treated"] == 0, "approx_parents"].sum()) if not counts.empty else 0
+        support_rows.append({"stack_cohort": cohort, "treated_parents": treated_count, "control_parents": control_count})
+
+    unioned = stacked_parts[0]
+    for part in stacked_parts[1:]:
+        unioned = unioned.unionByName(part, allowMissingColumns=True)
+    return unioned, pd.DataFrame(support_rows)
+
+
+def distinct_unit_columns(source_level: str) -> list[str]:
+    if source_level == "occupation":
+        return ["occupation"]
+    if source_level == "parent_occ":
+        return ["parent_rcid", "occupation"]
+    return ["parent_rcid", "occupation", "year"]
+
+
+def find_available_visibility_specs(
+    config: dict[str, object],
+    base_columns: list[str],
+    visibility_columns: list[str],
+) -> list[dict[str, object]]:
+    available = set(base_columns) | set(visibility_columns)
+    specs: list[dict[str, object]] = []
+    for spec in configured_visibility_variables(config):
+        name = spec["name"]
+        if name in available:
+            enriched = dict(spec)
+            enriched["safe_name"] = safe_visibility_name(name)
+            enriched["present_in_base_sample"] = name in base_columns
+            enriched["present_in_visibility_panel"] = name in visibility_columns
+            specs.append(enriched)
+    return specs
+
+
+def add_visibility_columns(
+    sample: DataFrame,
+    *,
+    visibility_specs: list[dict[str, object]],
+    visibility_panel: DataFrame | None,
+    logger,
+    config: dict[str, object],
+) -> tuple[DataFrame, pd.DataFrame]:
+    if not visibility_specs:
+        return sample, pd.DataFrame(
+            columns=[
+                "visibility_variable",
+                "visibility_label",
+                "safe_name",
+                "source_level",
+                "mean",
+                "std_dev",
+                "median",
+                "min",
+                "max",
+                "n_nonmissing_rows",
+                "n_nonmissing_units",
+                "skip_regression",
+                "skip_reason",
+            ]
+        )
+
+    source_columns = [spec["name"] for spec in visibility_specs if spec["name"] not in sample.columns]
+    if source_columns:
+        if visibility_panel is None:
+            missing = ", ".join(source_columns)
+            raise ValueError(f"Visibility variables require a companion panel, but none was available: {missing}")
+        visibility_source = visibility_panel.select(*KEY_COLUMNS, *source_columns)
+        dup = visibility_source.groupBy(*KEY_COLUMNS).count().where(F.col("count") > 1)
+        if dup.limit(1).count() > 0:
+            raise ValueError("Configured visibility companion panel is not unique on (parent_rcid, occupation, year).")
+        visibility_source = visibility_source.dropDuplicates(KEY_COLUMNS)
+        sample = sample.join(visibility_source, on=KEY_COLUMNS, how="left")
+
+    minimum_std = float(config["visibility_event_studies"].get("minimum_std_dev", 1e-8))
+    summaries: list[dict[str, object]] = []
+    for spec in visibility_specs:
+        name = spec["name"]
+        safe_name = spec["safe_name"]
+        raw_col = f"{safe_name}_raw"
+        std_col = f"{safe_name}_std"
+        high_col = f"{safe_name}_high"
+        unit_cols = distinct_unit_columns(str(spec.get("source_level", "occupation")))
+
+        sample = sample.withColumn(raw_col, F.col(name).cast("double"))
+        unit_frame = sample.select(*(unit_cols + [raw_col])).where(F.col(raw_col).isNotNull()).dropDuplicates(unit_cols)
+        n_units = unit_frame.count()
+        n_nonmissing_rows = sample.where(F.col(raw_col).isNotNull()).count()
+        stats_row = (
+            unit_frame.agg(
+                F.avg(F.col(raw_col)).alias("mean"),
+                F.stddev(F.col(raw_col)).alias("std_dev"),
+                F.min(F.col(raw_col)).alias("min"),
+                F.max(F.col(raw_col)).alias("max"),
+            ).toPandas().iloc[0].to_dict()
+            if n_units > 0
+            else {"mean": None, "std_dev": None, "min": None, "max": None}
+        )
+        median = None
+        if n_units > 0:
+            quantiles = unit_frame.approxQuantile(raw_col, [0.5], 0.001)
+            median = quantiles[0] if quantiles else None
+
+        mean_value = stats_row.get("mean")
+        std_value = stats_row.get("std_dev")
+        skip_reason = ""
+        skip_regression = False
+        if n_units == 0 or mean_value is None or std_value is None:
+            skip_regression = True
+            skip_reason = "no_nonmissing_visibility"
+            sample = sample.withColumn(std_col, F.lit(None).cast("double"))
+            sample = sample.withColumn(high_col, F.lit(None).cast("int"))
+        elif abs(float(std_value)) <= minimum_std:
+            skip_regression = True
+            skip_reason = "near_zero_variance"
+            sample = sample.withColumn(std_col, F.lit(None).cast("double"))
+            sample = sample.withColumn(
+                high_col,
+                F.when(F.col(raw_col).isNotNull(), F.lit(1)).otherwise(F.lit(None).cast("int")),
+            )
+        else:
+            sample = sample.withColumn(std_col, (F.col(raw_col) - F.lit(float(mean_value))) / F.lit(float(std_value)))
+            sample = sample.withColumn(
+                high_col,
+                F.when(F.col(raw_col).isNull(), F.lit(None).cast("int"))
+                .when(F.col(raw_col) >= F.lit(float(median)), F.lit(1))
+                .otherwise(F.lit(0)),
+            )
+
+        logger.info(
+            "Visibility variable %s: n_units=%s n_nonmissing_rows=%s mean=%s std=%s skip=%s reason=%s",
+            name,
+            n_units,
+            n_nonmissing_rows,
+            mean_value,
+            std_value,
+            skip_regression,
+            skip_reason,
+        )
+        summaries.append(
+            {
+                "visibility_variable": name,
+                "visibility_label": spec.get("label", name),
+                "safe_name": safe_name,
+                "source_level": spec.get("source_level", "occupation"),
+                "mean": mean_value,
+                "std_dev": std_value,
+                "median": median,
+                "min": stats_row.get("min"),
+                "max": stats_row.get("max"),
+                "n_nonmissing_rows": n_nonmissing_rows,
+                "n_nonmissing_units": n_units,
+                "skip_regression": int(skip_regression),
+                "skip_reason": skip_reason,
+            }
+        )
+
+    return sample, pd.DataFrame(summaries)
+
+
+def add_visibility_interactions(sample: DataFrame, config: dict[str, object], visibility_specs: list[dict[str, object]], *, prefix: str = "event") -> DataFrame:
+    for spec in visibility_specs:
+        std_col = f"{spec['safe_name']}_std"
+        for event_time in event_time_values(config, include_omitted=False):
+            interaction_name = visibility_interaction_name(event_time, spec["name"], prefix=prefix)
+            sample = sample.withColumn(interaction_name, F.col(event_dummy_name(event_time, prefix=prefix)).cast("double") * F.col(std_col))
+    return sample
+
+
+def build_visibility_support(sample: DataFrame, visibility_specs: list[dict[str, object]]) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for spec in visibility_specs:
+        raw_col = f"{spec['safe_name']}_raw"
+        support = (
+            sample.where((F.col("treated_event_row") == 1) & F.col(raw_col).isNotNull())
+            .groupBy("event_time_binned")
+            .agg(
+                F.count(F.lit(1)).alias("treated_rows"),
+                F.approx_count_distinct("parent_rcid").alias("treated_approx_parents"),
+                F.approx_count_distinct("parent_occ_fe").alias("treated_approx_parent_occ_cells"),
+            )
+            .orderBy("event_time_binned")
+            .toPandas()
+        )
+        if support.empty:
+            rows.append(
+                {
+                    "visibility_variable": spec["name"],
+                    "visibility_label": spec.get("label", spec["name"]),
+                    "event_time": None,
+                    "treated_rows": 0,
+                    "treated_approx_parents": 0,
+                    "treated_approx_parent_occ_cells": 0,
+                }
+            )
+            continue
+        support["visibility_variable"] = spec["name"]
+        support["visibility_label"] = spec.get("label", spec["name"])
+        support = support.rename(columns={"event_time_binned": "event_time"})
+        rows.extend(support.to_dict(orient="records"))
+    return pd.DataFrame(rows)
+
+
+def build_visibility_missingness(sample: DataFrame, visibility_specs: list[dict[str, object]]) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for spec in visibility_specs:
+        raw_col = f"{spec['safe_name']}_raw"
+        row = (
+            sample.agg(
+                F.count(F.lit(1)).alias("n_rows"),
+                F.sum(F.when(F.col(raw_col).isNull(), 1).otherwise(0)).alias("missing_rows"),
+                F.approx_count_distinct("parent_rcid").alias("n_parents"),
+                F.approx_count_distinct("occupation").alias("n_occupations"),
+                F.approx_count_distinct("year").alias("n_years"),
+            ).toPandas().iloc[0].to_dict()
+        )
+        row["visibility_variable"] = spec["name"]
+        row["visibility_label"] = spec.get("label", spec["name"])
+        row["nonmissing_rows"] = int(row["n_rows"] - row["missing_rows"])
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_stacked_visibility_support(stacked_sample: DataFrame | None, visibility_specs: list[dict[str, object]]) -> pd.DataFrame:
+    if stacked_sample is None:
+        return pd.DataFrame(columns=["visibility_variable", "stack_cohort", "event_time", "treated_rows", "treated_approx_parents", "treated_approx_parent_occ_cells"])
+    rows: list[dict[str, object]] = []
+    for spec in visibility_specs:
+        raw_col = f"{spec['safe_name']}_raw"
+        support = (
+            stacked_sample.where((F.col("stack_treated") == 1) & F.col(raw_col).isNotNull())
+            .groupBy("stack_cohort", "stack_event_time_binned")
+            .agg(
+                F.count(F.lit(1)).alias("treated_rows"),
+                F.approx_count_distinct("parent_rcid").alias("treated_approx_parents"),
+                F.approx_count_distinct("parent_occ_fe").alias("treated_approx_parent_occ_cells"),
+            )
+            .orderBy("stack_cohort", "stack_event_time_binned")
+            .toPandas()
+        )
+        if support.empty:
+            continue
+        support["visibility_variable"] = spec["name"]
+        support = support.rename(columns={"stack_event_time_binned": "event_time"})
+        rows.extend(support.to_dict(orient="records"))
+    return pd.DataFrame(rows)
 
 
 def main() -> None:
     args = parse_args()
     config = load_json(args.config_path)
-    paths = build_analysis_paths(args.project_root)
+    paths = build_analysis_paths(args.project_root, output_relative_root=config["output_relative_root"])
     ensure_analysis_directories(paths)
 
-    sample_path = Path(args.output_dir) if args.output_dir else paths.samples_root / "revelio_event_study_sample.parquet"
-    diagnostics_dir = paths.diagnostics_root / "event_study_sample"
-    tables_dir = paths.tables_root / "event_study_sample"
-    inspection_dir = Path(args.inspection_dir) if args.inspection_dir else paths.diagnostics_root / "input_inspection"
-    ensure_directory(sample_path.parent)
-    ensure_directory(diagnostics_dir)
-    ensure_directory(tables_dir)
+    inspection_dir = Path(args.inspection_dir) if args.inspection_dir else paths.inspection_root
+    output_dir = Path(args.output_dir) if args.output_dir else paths.sample_root
+    visibility_output_dir = Path(args.visibility_output_dir) if args.visibility_output_dir else paths.visibility_sample_root
+    ensure_directory(inspection_dir)
+    ensure_directory(output_dir)
+    ensure_directory(visibility_output_dir)
 
     logger = setup_logging("01_build_event_study_sample", paths.logs_root)
-    dataset_path = Path(args.dataset_path) if args.dataset_path else default_dataset_path(args.project_root, config)
-    min_pre_periods = args.min_pre_periods or int(config["event_time_defaults"]["min_pre_periods"])
-    min_post_periods = args.min_post_periods or int(config["event_time_defaults"]["min_post_periods"])
+    parent_year_dir = Path(args.parent_year_dir) if args.parent_year_dir else default_parent_year_path(args.project_root, config)
+    parent_occ_dir = Path(args.parent_occ_dir) if args.parent_occ_dir else default_parent_occ_path(args.project_root, config)
+    visibility_panel_dir = Path(args.visibility_panel_dir) if args.visibility_panel_dir else default_visibility_panel_path(args.project_root, config)
 
     spark = create_spark(
-        "revelio_event_study_sample_builder",
+        "build_parent_occ_event_study_sample",
         shuffle_partitions=args.shuffle_partitions,
         tmpdir=args.tmpdir,
     )
 
-    logger.info("Reading dataset from %s", dataset_path)
-    df = spark.read.parquet(str(dataset_path))
-    initial_rows = df.count()
-    restriction_records: list[dict[str, object]] = []
+    parent_year = spark.read.parquet(str(parent_year_dir))
+    parent_occ = spark.read.parquet(str(parent_occ_dir))
+    visibility_panel = spark.read.parquet(str(visibility_panel_dir)) if visibility_enabled(config) and visibility_panel_dir.exists() else None
 
-    before = initial_rows
-    df = df.where(F.col("firm_key").isNotNull() & F.col("year").isNotNull())
-    after = df.count()
-    append_restriction(
-        restriction_records,
-        step="drop_missing_keys",
-        before_rows=before,
-        after_rows=after,
-        reason="firm_key and year must both be present",
+    required_outcome_cols = required_outcomes(config)
+    optional_outcome_cols = [column for column in optional_outcomes(config) if column in parent_occ.columns]
+    active_outcomes = [column for column in required_outcome_cols + optional_outcome_cols if column in parent_occ.columns]
+
+    restriction_records: list[dict[str, object]] = []
+    parent_year_summary = build_parent_year_summary(parent_year)
+    parent_occ_summary = build_parent_occ_summary(parent_occ)
+    window = load_window(
+        inspection_dir=inspection_dir,
+        parent_year_summary=parent_year_summary,
+        parent_occ_summary=parent_occ_summary,
+        config=config,
     )
 
-    windows = load_windows(df, inspection_dir, config)
-    global_start_year = min(window["start_year"] for window in windows.values())
-    global_end_year = max(window["end_year"] for window in windows.values())
+    treatment_map, inconsistent_timing = build_parent_treatment(parent_year)
+    inconsistent_count = inconsistent_timing.count()
+    if inconsistent_count > 0:
+        raise ValueError(f"Found {inconsistent_count} parents with inconsistent treatment timing in parent-year input.")
+
+    base_before = parent_occ.count()
+    parent_occ = parent_occ.where(F.col("parent_rcid").isNotNull() & F.col("occupation").isNotNull() & F.col("year").isNotNull())
+    base_after = parent_occ.count()
+    append_restriction(
+        restriction_records,
+        step="drop_missing_parent_occ_keys",
+        before_rows=base_before,
+        after_rows=base_after,
+        reason="parent_rcid, occupation, and year must all be present",
+    )
+
+    if "occupation_analysis_sample" in parent_occ.columns:
+        before = base_after
+        parent_occ = parent_occ.where(F.col("occupation_analysis_sample") == 1)
+        after = parent_occ.count()
+        append_restriction(
+            restriction_records,
+            step="occupation_analysis_sample",
+            before_rows=before,
+            after_rows=after,
+            reason="keep safe-v3 analysis cells with enough within-cell support",
+        )
+    else:
+        after = base_after
 
     before = after
-    df = df.where(F.col("year").between(global_start_year, global_end_year))
-    after = df.count()
+    parent_occ = parent_occ.where(F.col("year").between(int(window["start_year"]), int(window["end_year"])))
+    after = parent_occ.count()
     append_restriction(
         restriction_records,
-        step="global_year_window",
+        step="recommended_window",
         before_rows=before,
         after_rows=after,
-        reason="restrict to common estimation years implied by inspection windows",
-        detail=f"{global_start_year} to {global_end_year}",
+        reason="restrict to recommended estimation years from joint inspection",
+        detail=f"{window['start_year']} to {window['end_year']}",
     )
 
-    df = df.withColumn("naics2", extract_naics_digits(F.col("naics_code"), 2))
-    df = df.withColumn("has_both_data_by_year", F.when((F.col("has_position_data") == 1) & (F.col("has_posting_data") == 1), F.lit(1)).otherwise(F.lit(0)))
-    df = df.withColumn("log_workforce", F.when(F.col("workforce_weighted") > 0, F.log(F.col("workforce_weighted"))).otherwise(F.lit(None)))
-    df = df.withColumn("log_posting_count", F.when(F.col("posting_count").isNotNull(), F.log1p(F.col("posting_count"))).otherwise(F.lit(None)))
+    dup = parent_occ.groupBy(*KEY_COLUMNS).count().where(F.col("count") > 1)
+    if dup.limit(1).count() > 0:
+        dup.orderBy(F.col("count").desc()).limit(1000).coalesce(1).write.mode("overwrite").option("header", True).csv(str(output_dir / "duplicate_parent_occ_keys_probe"))
+        raise ValueError("parent_occupation_year_panel_paonly_safe_v3 is not unique on (parent_rcid, occupation, year).")
 
-    lag_window = Window.partitionBy("firm_key").orderBy("year")
-    df = df.withColumn("lag_log_workforce", F.lag("log_workforce").over(lag_window))
-    df = df.withColumn(
-        "workforce_growth",
-        F.when(F.col("log_workforce").isNotNull() & F.col("lag_log_workforce").isNotNull(), F.col("log_workforce") - F.col("lag_log_workforce")).otherwise(F.lit(None)),
+    drop_existing = [column for column in JOIN_TREATMENT_COLUMNS if column in parent_occ.columns]
+    if drop_existing:
+        parent_occ = parent_occ.drop(*drop_existing)
+
+    sample = parent_occ.join(
+        treatment_map.select("parent_rcid", "first_people_analytics_posting_year_any_enriched", "ever_treated"),
+        on="parent_rcid",
+        how="left",
     )
+    sample = sample.withColumn("parent_occ_fe", F.concat_ws("::", F.col("parent_rcid").cast("string"), F.col("occupation").cast("string")))
+    sample = sample.withColumn("parent_year_fe", F.concat_ws("::", F.col("parent_rcid").cast("string"), F.col("year").cast("string")))
+    sample = sample.withColumn("occupation_year_fe", F.concat_ws("::", F.col("occupation").cast("string"), F.col("year").cast("string")))
+    sample = add_event_columns(sample, config)
 
-    df, heterogeneity_meta = add_main_heterogeneity_flags(df, global_start_year)
-    df, winsor_quantiles = add_winsorized_columns(df, config.get("winsorization", []), logger)
+    base_sample_path = output_dir / "parent_occ_event_study_sample.parquet"
+    stacked_sample_path = output_dir / "parent_occ_event_study_stacked_sample.parquet"
 
-    treatment_specs = treatment_frame(config).to_dict(orient="records")
-    support_tables: list[pd.DataFrame] = []
-    cohort_records: list[dict[str, object]] = []
-    supported_windows: dict[str, int] = {}
+    support_table = build_support_table(sample)
+    cohort_table = build_cohort_table(sample)
+    outcome_nonmissing = build_outcome_nonmissing(sample, active_outcomes)
 
-    for treatment in treatment_specs:
-        treatment_name = str(treatment["name"])
-        first_treat_col = str(treatment["first_treat_col"])
-        window = windows[treatment_name]
-        logger.info(
-            "Adding treatment design columns for %s using %s over %s-%s",
-            treatment_name,
-            first_treat_col,
-            window["start_year"],
-            window["end_year"],
-        )
-        df = add_treatment_design_columns(
-            df,
-            treatment_name=treatment_name,
-            first_treat_col=first_treat_col,
-            start_year=int(window["start_year"]),
-            end_year=int(window["end_year"]),
-            min_pre_periods=min_pre_periods,
-            min_post_periods=min_post_periods,
-        )
+    stacked_sample, stacked_support = build_stacked_sample(sample, config, logger)
+    write_parquet(sample, base_sample_path, args.coalesce)
+    if stacked_sample is not None:
+        write_parquet(stacked_sample, stacked_sample_path, args.coalesce)
 
-        support = build_event_support(df, treatment_name)
-        supported_window = choose_supported_event_window(
-            support,
-            config["event_time_defaults"]["candidate_windows"],
-            min_event_bin_treated_firms=int(config["event_time_defaults"]["min_event_bin_treated_firms"]),
-            min_event_bin_rows=int(config["event_time_defaults"]["min_event_bin_rows"]),
-        )
-        support["selected_window"] = supported_window
-        support_tables.append(support)
-        supported_windows[treatment_name] = supported_window
-        df = add_binned_event_time(df, treatment_name, supported_window)
-
-        cohort_counts = (
-            df.select(
-                "firm_key",
-                F.col(first_treat_col).alias("first_treat_year"),
-                F.col(f"{treatment_name}_ever_treated").alias("ever_treated"),
-                F.col(f"{treatment_name}_treated_cohort_in_window").alias("treated_cohort_in_window"),
-                F.col(f"{treatment_name}_balanced_treated").alias("balanced_treated"),
-                F.col(f"{treatment_name}_early_treated_excluded").alias("early_treated_excluded"),
-                F.col(f"{treatment_name}_late_treated_control").alias("late_treated_control"),
+    stacked_event_support = pd.DataFrame()
+    if stacked_sample is not None:
+        stacked_event_support = (
+            stacked_sample.where(F.col("stack_treated") == 1)
+            .groupBy("stack_cohort", "stack_event_time_binned")
+            .agg(
+                F.count(F.lit(1)).alias("treated_rows"),
+                F.approx_count_distinct("parent_rcid").alias("treated_approx_parents"),
+                F.approx_count_distinct("parent_occ_fe").alias("treated_approx_parent_occ_cells"),
             )
-            .dropDuplicates(["firm_key"])
+            .orderBy("stack_cohort", "stack_event_time_binned")
             .toPandas()
+            .rename(columns={"stack_event_time_binned": "event_time"})
         )
-        cohort_records.append(
-            {
-                "treatment_name": treatment_name,
-                "eligible_window_start_year": int(window["start_year"]),
-                "eligible_window_end_year": int(window["end_year"]),
-                "selected_event_window": int(supported_window),
-                "never_treated_firms": int((cohort_counts["ever_treated"] == 0).sum()),
-                "treated_firms_any": int((cohort_counts["ever_treated"] == 1).sum()),
-                "treated_cohort_in_window_firms": int((cohort_counts["treated_cohort_in_window"] == 1).sum()),
-                "balanced_treated_firms": int((cohort_counts["balanced_treated"] == 1).sum()),
-                "early_treated_excluded_firms": int((cohort_counts["early_treated_excluded"] == 1).sum()),
-                "late_treated_control_firms": int((cohort_counts["late_treated_control"] == 1).sum()),
-            }
-        )
-
-        cohort_by_year = (
-            cohort_counts.loc[cohort_counts["balanced_treated"] == 1, ["first_treat_year"]]
-            .value_counts()
-            .reset_index(name="balanced_treated_firms")
-            .sort_values("first_treat_year")
-        )
-        cohort_by_year["treatment_name"] = treatment_name
-        write_pandas_csv(cohort_by_year, tables_dir / f"{treatment_name}_cohort_counts_by_year.csv")
-
-    support_frame = pd.concat(support_tables, ignore_index=True) if support_tables else pd.DataFrame()
-    cohort_summary = pd.DataFrame(cohort_records)
 
     metadata = {
-        "dataset_path": str(dataset_path),
-        "sample_path": str(sample_path),
-        "global_start_year": global_start_year,
-        "global_end_year": global_end_year,
-        "recommended_windows": windows,
-        "supported_event_windows": supported_windows,
-        "min_pre_periods": min_pre_periods,
-        "min_post_periods": min_post_periods,
-        "winsor_quantiles": winsor_quantiles,
-        "heterogeneity_cutoffs": heterogeneity_meta,
+        "parent_year_dir": str(parent_year_dir),
+        "parent_occ_dir": str(parent_occ_dir),
+        "sample_path": str(base_sample_path),
+        "stacked_sample_path": str(stacked_sample_path) if stacked_sample is not None else None,
+        "output_dir": str(output_dir),
+        "recommended_window": window,
+        "treatment_first_year_column": config["treatment"]["first_treat_col"],
+        "event_time": config["event_time"],
+        "active_outcomes": active_outcomes,
+        "cluster_var": config["metadata"]["cluster_var"],
+        "baseline_fixed_effects": [config["metadata"]["baseline_unit_fe"], config["metadata"]["baseline_time_fe"]],
+        "stacked_fixed_effects": [config["metadata"]["stacked_unit_fe"], config["metadata"]["stacked_time_fe"]],
+        "n_rows_sample": sample.count(),
+        "n_parent_occ_cells": sample.select("parent_occ_fe").distinct().count(),
+        "n_parents": sample.select("parent_rcid").distinct().count(),
+        "n_treated_parents": sample.where(F.col("ever_treated") == 1).select("parent_rcid").distinct().count(),
+        "stacked_available": stacked_sample is not None,
     }
 
-    logger.info("Writing cleaned event-study sample to %s", sample_path)
-    write_parquet(df, sample_path, args.coalesce)
-    write_pandas_csv(support_frame, diagnostics_dir / "event_time_support_by_treatment.csv")
-    write_pandas_csv(cohort_summary, tables_dir / "cohort_summary.csv")
-    write_json(metadata, diagnostics_dir / "sample_metadata.json")
+    write_json(metadata, output_dir / "00_sample_metadata.json")
+    write_pandas_csv(cohort_table, output_dir / "01_adoption_cohort_counts.csv")
+    write_pandas_csv(support_table, output_dir / "02_event_time_support.csv")
+    write_pandas_csv(outcome_nonmissing, output_dir / "03_outcome_nonmissing.csv")
+    write_pandas_csv(stacked_support, output_dir / "04_stacked_cohort_support.csv")
+    write_pandas_csv(stacked_event_support, output_dir / "05_stacked_event_time_support.csv")
     write_restriction_outputs(
         restriction_records,
-        diagnostics_dir / "sample_restrictions.csv",
-        diagnostics_dir / "sample_restrictions.md",
-        "Revelio Event-Study Sample Restrictions",
+        output_dir / "06_sample_restrictions.csv",
+        output_dir / "06_sample_restrictions.md",
+        "Parent-Occupation Event-Study Sample Restrictions",
     )
 
-    logger.info("Sample build complete. Outputs written to %s", sample_path)
+    logger.info("Base event-study sample written to %s", base_sample_path)
+
+    if visibility_enabled(config):
+        visibility_specs = find_available_visibility_specs(
+            config,
+            base_columns=sample.columns,
+            visibility_columns=visibility_panel.columns if visibility_panel is not None else [],
+        )
+        if not visibility_specs:
+            raise ValueError("Visibility event studies are enabled, but no configured visibility variables were found in the live sample or companion panel.")
+
+        visibility_sample = sample
+        visibility_sample, visibility_summary = add_visibility_columns(
+            visibility_sample,
+            visibility_specs=visibility_specs,
+            visibility_panel=visibility_panel,
+            logger=logger,
+            config=config,
+        )
+        visibility_sample = add_visibility_interactions(visibility_sample, config, visibility_specs, prefix="event")
+        visibility_stacked_sample, visibility_stacked_support = build_stacked_sample(visibility_sample, config, logger)
+        if visibility_stacked_sample is not None:
+            visibility_stacked_sample = add_visibility_interactions(visibility_stacked_sample, config, visibility_specs, prefix="stack_event")
+
+        visibility_support = build_visibility_support(visibility_sample, visibility_specs)
+        visibility_missingness = build_visibility_missingness(visibility_sample, visibility_specs)
+        visibility_stacked_event_support = build_stacked_visibility_support(visibility_stacked_sample, visibility_specs)
+
+        visibility_sample_path = visibility_output_dir / "parent_occ_visibility_event_study_sample.parquet"
+        visibility_stacked_sample_path = visibility_output_dir / "parent_occ_visibility_event_study_stacked_sample.parquet"
+        write_parquet(visibility_sample, visibility_sample_path, args.coalesce)
+        if visibility_stacked_sample is not None:
+            write_parquet(visibility_stacked_sample, visibility_stacked_sample_path, args.coalesce)
+
+        visibility_metadata = {
+            "visibility_panel_dir": str(visibility_panel_dir) if visibility_panel_dir.exists() else None,
+            "visibility_sample_path": str(visibility_sample_path),
+            "visibility_stacked_sample_path": str(visibility_stacked_sample_path) if visibility_stacked_sample is not None else None,
+            "visibility_variables_used": visibility_summary["visibility_variable"].tolist(),
+            "visibility_output_dir": str(visibility_output_dir),
+            "n_rows_visibility_sample": visibility_sample.count(),
+            "n_parent_occ_cells": visibility_sample.select("parent_occ_fe").distinct().count(),
+            "n_parents": visibility_sample.select("parent_rcid").distinct().count(),
+            "n_occupations": visibility_sample.select("occupation").distinct().count(),
+            "n_years": visibility_sample.select("year").distinct().count(),
+            "cluster_var": config["metadata"]["cluster_var"],
+            "fixed_effects": [
+                config["metadata"]["visibility_unit_fe"],
+                config["metadata"]["visibility_parent_time_fe"],
+                config["metadata"]["visibility_occ_time_fe"],
+            ],
+            "stacked_fixed_effects": [
+                config["metadata"]["stacked_visibility_unit_fe"],
+                config["metadata"]["stacked_visibility_parent_time_fe"],
+                config["metadata"]["stacked_visibility_occ_time_fe"],
+            ],
+        }
+
+        write_json(visibility_metadata, visibility_output_dir / "00_visibility_sample_metadata.json")
+        write_pandas_csv(visibility_summary, visibility_output_dir / "01_visibility_variable_summary.csv")
+        write_pandas_csv(visibility_support, visibility_output_dir / "02_visibility_event_time_support.csv")
+        write_pandas_csv(visibility_missingness, visibility_output_dir / "03_visibility_missingness.csv")
+        write_pandas_csv(visibility_stacked_support, visibility_output_dir / "04_visibility_stacked_cohort_support.csv")
+        write_pandas_csv(visibility_stacked_event_support, visibility_output_dir / "05_visibility_stacked_event_time_support.csv")
+        logger.info("Visibility event-study sample written to %s", visibility_sample_path)
+
     spark.stop()
 
 

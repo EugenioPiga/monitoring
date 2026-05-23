@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=evt_paocc_02
-#SBATCH --output=logs/evt_paocc_02_%j.out
-#SBATCH --error=logs/evt_paocc_02_%j.err
+#SBATCH --job-name=evt_paocc_05
+#SBATCH --output=logs/evt_paocc_05_%j.out
+#SBATCH --error=logs/evt_paocc_05_%j.err
 #SBATCH --time=18:00:00
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=180G
@@ -16,7 +16,7 @@ CONFIG_PATH="${CONFIG_PATH:-$PROJECT_ROOT/configs/revelio_event_study_config.jso
 SAMPLE_DIR="${SAMPLE_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/sample}"
 VISIBILITY_SAMPLE_DIR="${VISIBILITY_SAMPLE_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/visibility_sample}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3}"
-RUN_STACKED="${RUN_STACKED:-1}"
+RUN_VISIBILITY_STACKED="${RUN_VISIBILITY_STACKED:-1}"
 SPARK_BASE_DIR="${SPARK_BASE_DIR:-/labs/khanna/predictive_capital/scratch/revelio_event_study/${USER}}"
 JOB_SCRATCH="$SPARK_BASE_DIR/${SLURM_JOB_ID}"
 
@@ -54,11 +54,13 @@ python -u "$CODE_DIR/analysis/02_estimate_event_studies.py" \
   --visibility-sample-dir "$VISIBILITY_SAMPLE_DIR" \
   --output-dir "$OUTPUT_DIR" \
   --config-path "$CONFIG_PATH" \
-  --run-base 1 \
-  --run-stacked "$RUN_STACKED"
+  --run-base 0 \
+  --run-stacked 0 \
+  --run-visibility 1 \
+  --run-visibility-stacked "$RUN_VISIBILITY_STACKED"
 
-echo "[CHECK] estimation outputs:"
-find "$OUTPUT_DIR/results" -maxdepth 1 -type f | sort | head || true
-find "$OUTPUT_DIR/results" -maxdepth 1 -type f | wc -l || true
+echo "[CHECK] visibility estimation outputs:"
+find "$OUTPUT_DIR/visibility_results" -maxdepth 1 -type f | sort | head || true
+find "$OUTPUT_DIR/visibility_results" -maxdepth 1 -type f | wc -l || true
 
 echo "[INFO] Done."

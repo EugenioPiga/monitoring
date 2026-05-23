@@ -5,24 +5,24 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 from pathlib import Path
+import re
+import sys
 
 import pandas as pd
+from pyspark.sql import DataFrame, functions as F
 
 SCRIPT_PATH = Path(__file__).resolve()
 PROJECT_ROOT = SCRIPT_PATH.parents[2]
 CODE_ROOT = PROJECT_ROOT / "code"
-
-import sys
-
 if str(CODE_ROOT) not in sys.path:
     sys.path.insert(0, str(CODE_ROOT))
 
-from pyspark.sql import functions as F
-
-from utils.revelio_analysis_utils import (
+from utils.revelio_analysis_utils import (  # noqa: E402
     build_analysis_paths,
     create_spark,
-    default_dataset_path,
+    default_parent_occ_path,
+    default_parent_year_path,
+    default_visibility_panel_path,
     ensure_analysis_directories,
     ensure_directory,
     load_json,
@@ -31,305 +31,477 @@ from utils.revelio_analysis_utils import (
     write_pandas_csv,
     write_text,
 )
-from utils.revelio_event_study_design import recommend_windows
+from utils.revelio_event_study_design import (  # noqa: E402
+    build_joint_year_frame,
+    configured_visibility_variables,
+    optional_outcomes,
+    outcome_frame,
+    recommend_estimation_window,
+    required_outcomes,
+    visibility_candidate_patterns,
+)
 
 
-REQUIRED_COLUMNS = [
-    "firm_key",
+PARENT_YEAR_REQUIRED = [
+    "parent_rcid",
     "year",
-    "has_position_data",
-    "has_posting_data",
-    "first_people_analytics_firm_year_any_enriched",
-    "first_people_analytics_position_year_any_enriched",
     "first_people_analytics_posting_year_any_enriched",
-    "is_first_people_analytics_firm_year_any_enriched",
-    "is_first_people_analytics_position_year_any_enriched",
-    "is_first_people_analytics_posting_year_any_enriched",
 ]
 
-PROFILE_COLUMNS = [
-    "firm_key",
+PARENT_OCC_REQUIRED = [
+    "parent_rcid",
+    "occupation",
     "year",
-    "has_position_data",
-    "has_posting_data",
-    "parent_rcid_matched",
-    "workforce_weighted",
-    "hire_rate",
-    "exit_rate",
-    "avg_salary",
-    "avg_start_salary",
-    "avg_end_salary",
-    "avg_seniority",
-    "posting_count",
-    "avg_posting_salary",
-    "people_analytics_positions_any_enriched_share",
-    "people_analytics_postings_any_enriched_share",
-    "first_people_analytics_firm_year_any_enriched",
-    "first_people_analytics_position_year_any_enriched",
-    "first_people_analytics_posting_year_any_enriched",
 ]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Inspect Revelio firm-year inputs for event-study analysis.")
+    parser = argparse.ArgumentParser(description="Inspect safe-v3 parent-year and parent-occupation-year event-study inputs.")
     parser.add_argument("--project-root", default=str(PROJECT_ROOT))
-    parser.add_argument("--dataset-path", default=None)
-    parser.add_argument(
-        "--output-dir",
-        default=None,
-        help="Directory for inspection outputs. Defaults to processed/analysis/diagnostics/input_inspection.",
-    )
+    parser.add_argument("--parent-year-dir", default=None)
+    parser.add_argument("--parent-occ-dir", default=None)
+    parser.add_argument("--visibility-panel-dir", default=None)
+    parser.add_argument("--output-dir", default=None)
     parser.add_argument("--config-path", default=str(PROJECT_ROOT / "configs" / "revelio_event_study_config.json"))
     parser.add_argument("--shuffle-partitions", type=int, default=400)
     parser.add_argument("--tmpdir", default=None)
+    parser.add_argument("--sample-cap", type=int, default=1_000_000)
     return parser.parse_args()
 
 
-def missing_profile(df, columns: list[str]) -> pd.DataFrame:
-    dtype_map = dict(df.dtypes)
-    exprs = []
-    for column in columns:
-        if column not in dtype_map:
-            continue
-        col_expr = F.col(column)
-        if dtype_map[column] in {"double", "float"}:
-            missing_expr = F.sum(F.when(col_expr.isNull() | F.isnan(col_expr), 1).otherwise(0)).alias(column)
-        else:
-            missing_expr = F.sum(F.when(col_expr.isNull(), 1).otherwise(0)).alias(column)
-        exprs.append(missing_expr)
-
-    row_count = df.limit(1000000).count()  # capped diagnostic count
-    if not exprs:
-        return pd.DataFrame(columns=["column_name", "dtype", "missing_count", "missing_share", "nonmissing_count"])
-
-    row = df.agg(*exprs).collect()[0].asDict()
-    records = []
-    for column in columns:
-        if column not in dtype_map:
-            continue
-        missing_count = int(row.get(column, 0) or 0)
-        records.append(
-            {
-                "column_name": column,
-                "dtype": dtype_map[column],
-                "missing_count": missing_count,
-                "missing_share": missing_count / row_count if row_count > 0 else None,
-                "nonmissing_count": row_count - missing_count,
-            }
-        )
-    return pd.DataFrame(records).sort_values(["missing_share", "column_name"], ascending=[False, True]).reset_index(drop=True)
+def approx_parent_year_duplicates(df: DataFrame) -> tuple[int, pd.DataFrame]:
+    dup = (
+        df.where(F.col("parent_rcid").isNotNull() & F.col("year").isNotNull())
+        .groupBy("parent_rcid", "year")
+        .count()
+        .where(F.col("count") > 1)
+    )
+    count = dup.limit(1000).count()
+    sample = dup.orderBy(F.col("count").desc()).limit(1000).toPandas()
+    return int(count), sample
 
 
-def build_year_summary(df) -> pd.DataFrame:
-    ordered = (
+def approx_parent_occ_duplicates(df: DataFrame, sample_cap: int) -> tuple[int, pd.DataFrame]:
+    probe = df.select("parent_rcid", "occupation", "year").where(
+        F.col("parent_rcid").isNotNull() & F.col("occupation").isNotNull() & F.col("year").isNotNull()
+    ).limit(sample_cap)
+    dup = probe.groupBy("parent_rcid", "occupation", "year").count().where(F.col("count") > 1)
+    count = dup.limit(1000).count()
+    sample = dup.orderBy(F.col("count").desc()).limit(1000).toPandas()
+    return int(count), sample
+
+
+def build_parent_year_summary(df: DataFrame) -> pd.DataFrame:
+    analysis_col = "analysis_sample" if "analysis_sample" in df.columns else None
+    posting_col = "people_analytics_postings_any_enriched" if "people_analytics_postings_any_enriched" in df.columns else None
+    grouped = (
         df.groupBy("year")
         .agg(
-            F.count(F.lit(1)).alias("row_count"),
-            F.countDistinct("firm_key").alias("distinct_firms"),
-            F.sum(F.when(F.col("has_position_data") == 1, 1).otherwise(0)).alias("position_rows"),
-            F.sum(F.when(F.col("has_posting_data") == 1, 1).otherwise(0)).alias("posting_rows"),
-            F.sum(F.when((F.col("has_position_data") == 1) & (F.col("has_posting_data") == 1), 1).otherwise(0)).alias("both_rows"),
-            F.sum(F.when((F.col("has_position_data") == 1) & (F.col("has_posting_data") == 0), 1).otherwise(0)).alias("position_only_rows"),
-            F.sum(F.when((F.col("has_position_data") == 0) & (F.col("has_posting_data") == 1), 1).otherwise(0)).alias("posting_only_rows"),
-            F.sum(F.when(F.col("hire_rate").isNotNull(), 1).otherwise(0)).alias("nonmissing_hire_rate"),
-            F.sum(F.when(F.col("exit_rate").isNotNull(), 1).otherwise(0)).alias("nonmissing_exit_rate"),
-            F.sum(F.when(F.col("workforce_weighted").isNotNull(), 1).otherwise(0)).alias("nonmissing_workforce"),
-            F.sum(F.when(F.col("posting_count").isNotNull(), 1).otherwise(0)).alias("nonmissing_posting_count"),
-            F.sum(F.when(F.col("avg_salary").isNotNull(), 1).otherwise(0)).alias("nonmissing_avg_salary"),
-            F.sum(F.when(F.col("is_first_people_analytics_firm_year_any_enriched") == 1, 1).otherwise(0)).alias("main_adoptions"),
-            F.sum(F.when(F.col("is_first_people_analytics_position_year_any_enriched") == 1, 1).otherwise(0)).alias("position_adoptions"),
-            F.sum(F.when(F.col("is_first_people_analytics_posting_year_any_enriched") == 1, 1).otherwise(0)).alias("posting_adoptions"),
+            F.count(F.lit(1)).alias("parent_year_rows"),
+            F.approx_count_distinct("parent_rcid").alias("parent_year_approx_parents"),
+            F.sum(F.when(F.col("is_first_people_analytics_posting_year_any_enriched") == 1, 1).otherwise(0)).alias("parent_year_adoptions"),
+            F.sum(F.when(F.col("first_people_analytics_posting_year_any_enriched").isNotNull(), 1).otherwise(0)).alias("parent_year_rows_with_timing"),
+            (
+                F.sum(F.when(F.col(analysis_col) == 1, 1).otherwise(0)).alias("parent_year_analysis_rows")
+                if analysis_col
+                else F.lit(None).cast("double").alias("parent_year_analysis_rows")
+            ),
+            (
+                F.sum(F.when(F.col(posting_col).isNotNull(), 1).otherwise(0)).alias("parent_year_nonmissing_posting_signal")
+                if posting_col
+                else F.lit(None).cast("double").alias("parent_year_nonmissing_posting_signal")
+            ),
         )
-        .orderBy(F.col("year").asc_nulls_last())
+        .orderBy("year")
     )
-    return ordered.toPandas()
+    return grouped.toPandas()
 
 
-def build_first_treat_distribution(df, first_treat_col: str, label: str) -> pd.DataFrame:
-    if first_treat_col not in df.columns:
-        return pd.DataFrame(columns=["first_treat_year", "firm_count", "label"])
-    frame = (
-        df.select("firm_key", first_treat_col)
-        .dropDuplicates(["firm_key"])
-        .where(F.col(first_treat_col).isNotNull())
-        .groupBy(first_treat_col)
-        .agg(F.countDistinct("firm_key").alias("firm_count"))
-        .orderBy(first_treat_col)
-        .toPandas()
+def build_parent_occ_summary(df: DataFrame, outcomes: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    analysis_col = "occupation_analysis_sample" if "occupation_analysis_sample" in df.columns else None
+    agg_exprs = [
+        F.count(F.lit(1)).alias("parent_occ_rows"),
+        F.approx_count_distinct("parent_rcid").alias("parent_occ_approx_parents"),
+        F.approx_count_distinct("occupation").alias("parent_occ_approx_occupations"),
+        (
+            F.sum(F.when(F.col(analysis_col) == 1, 1).otherwise(0)).alias("parent_occ_analysis_rows")
+            if analysis_col
+            else F.lit(None).cast("double").alias("parent_occ_analysis_rows")
+        ),
+    ]
+    for outcome in outcomes:
+        if outcome in df.columns:
+            agg_exprs.append(F.sum(F.when(F.col(outcome).isNotNull(), 1).otherwise(0)).alias(f"nonmissing__{outcome}"))
+    yearly = df.groupBy("year").agg(*agg_exprs).orderBy("year").toPandas()
+
+    overall_exprs = []
+    for outcome in outcomes:
+        if outcome in df.columns:
+            overall_exprs.append(F.sum(F.when(F.col(outcome).isNotNull(), 1).otherwise(0)).alias(outcome))
+    overall = df.agg(*overall_exprs).toPandas().T.reset_index()
+    overall.columns = ["outcome", "nonmissing_rows"]
+    return yearly, overall
+
+
+def build_outcome_presence(df: DataFrame, config: dict[str, object]) -> pd.DataFrame:
+    frame = outcome_frame(config)
+    rows: list[dict[str, object]] = []
+    for _, row in frame.iterrows():
+        outcome = str(row["name"])
+        present = outcome in df.columns
+        rows.append(
+            {
+                "outcome": outcome,
+                "label": row["label"],
+                "group": row["group"],
+                "optional": bool(row.get("optional", False)),
+                "present": int(present),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_parent_timing_distribution(df: DataFrame) -> pd.DataFrame:
+    timing = (
+        df.select("parent_rcid", "first_people_analytics_posting_year_any_enriched")
+        .where(F.col("parent_rcid").isNotNull())
+        .groupBy("parent_rcid")
+        .agg(F.min("first_people_analytics_posting_year_any_enriched").alias("first_treat_year"))
+        .where(F.col("first_treat_year").isNotNull())
+        .groupBy("first_treat_year")
+        .agg(F.count("*").alias("treated_parents"))
+        .orderBy("first_treat_year")
     )
-    if frame.empty:
-        frame = pd.DataFrame(columns=[first_treat_col, "firm_count"])
-    frame = frame.rename(columns={first_treat_col: "first_treat_year"})
-    frame["label"] = label
-    return frame
+    return timing.toPandas()
 
 
-def build_firm_coverage_regime(df) -> pd.DataFrame:
-    firm_level = (
-        df.groupBy("firm_key")
+def build_parent_timing_consistency(df: DataFrame) -> pd.DataFrame:
+    timing = (
+        df.select("parent_rcid", "first_people_analytics_posting_year_any_enriched")
+        .where(F.col("parent_rcid").isNotNull())
+        .groupBy("parent_rcid")
         .agg(
-            F.max(F.when(F.col("has_position_data") == 1, 1).otherwise(0)).alias("ever_position"),
-            F.max(F.when(F.col("has_posting_data") == 1, 1).otherwise(0)).alias("ever_posting"),
+            F.countDistinct("first_people_analytics_posting_year_any_enriched").alias("distinct_timing_values"),
+            F.min("first_people_analytics_posting_year_any_enriched").alias("min_first_treat_year"),
+            F.max("first_people_analytics_posting_year_any_enriched").alias("max_first_treat_year"),
         )
-        .withColumn(
-            "coverage_regime",
-            F.when((F.col("ever_position") == 1) & (F.col("ever_posting") == 1), F.lit("both"))
-            .when((F.col("ever_position") == 1) & (F.col("ever_posting") == 0), F.lit("position_only"))
-            .when((F.col("ever_position") == 0) & (F.col("ever_posting") == 1), F.lit("posting_only"))
-            .otherwise(F.lit("neither")),
+        .where(F.col("distinct_timing_values") > 1)
+        .orderBy(F.col("distinct_timing_values").desc(), "parent_rcid")
+        .limit(1000)
+    )
+    return timing.toPandas()
+
+
+def is_numeric_dtype(dtype: str) -> bool:
+    numeric_prefixes = ("tinyint", "smallint", "int", "bigint", "float", "double", "decimal", "long", "short")
+    return any(dtype.startswith(prefix) for prefix in numeric_prefixes)
+
+
+def candidate_visibility_columns(columns: list[str], patterns: list[str]) -> list[str]:
+    regex = re.compile("|".join(re.escape(pattern) for pattern in patterns), re.IGNORECASE)
+    return [column for column in columns if regex.search(column)]
+
+
+def build_candidate_profile(df: DataFrame, columns: list[str], sample_cap: int, source_dataset: str) -> pd.DataFrame:
+    if not columns:
+        return pd.DataFrame(
+            columns=[
+                "source_dataset",
+                "column_name",
+                "dtype",
+                "n_nonmissing",
+                "n_distinct_approx",
+                "mean",
+                "sd",
+                "min",
+                "max",
+            ]
         )
-    )
-    return (
-        firm_level.groupBy("coverage_regime")
-        .agg(F.countDistinct("firm_key").alias("firm_count"))
-        .orderBy("coverage_regime")
-        .toPandas()
-    )
+    probe = df.select(*columns).limit(sample_cap).cache()
+    _ = probe.count()
+    dtype_map = dict(probe.dtypes)
+    rows: list[dict[str, object]] = []
+    for column in columns:
+        dtype = dtype_map.get(column, "")
+        exprs = [
+            F.sum(F.when(F.col(column).isNotNull(), 1).otherwise(0)).alias("n_nonmissing"),
+            F.approx_count_distinct(F.col(column)).alias("n_distinct_approx"),
+        ]
+        if is_numeric_dtype(dtype):
+            exprs.extend(
+                [
+                    F.avg(F.col(column).cast("double")).alias("mean"),
+                    F.stddev(F.col(column).cast("double")).alias("sd"),
+                    F.min(F.col(column).cast("double")).alias("min"),
+                    F.max(F.col(column).cast("double")).alias("max"),
+                ]
+            )
+        stats = probe.agg(*exprs).toPandas().iloc[0].to_dict()
+        rows.append(
+            {
+                "source_dataset": source_dataset,
+                "column_name": column,
+                "dtype": dtype,
+                "n_nonmissing": int(stats.get("n_nonmissing") or 0),
+                "n_distinct_approx": int(stats.get("n_distinct_approx") or 0),
+                "mean": stats.get("mean"),
+                "sd": stats.get("sd"),
+                "min": stats.get("min"),
+                "max": stats.get("max"),
+            }
+        )
+    probe.unpersist()
+    return pd.DataFrame(rows)
 
 
 def build_memo(
-    summary: dict[str, object],
-    recommended_windows: dict[str, object],
-    year_flags: pd.DataFrame,
-    firm_coverage: pd.DataFrame,
+    *,
+    parent_year_path: Path,
+    parent_occ_path: Path,
+    visibility_panel_path: Path | None,
+    recommended_window: dict[str, object],
+    classified_years: pd.DataFrame,
+    optional_present: list[str],
+    required_missing: list[str],
+    selected_visibility: list[str],
+    candidate_frame: pd.DataFrame,
 ) -> str:
     lines = [
-        "Revelio event-study input inspection memo",
+        "Safe-v3 parent-occupation event-study inspection memo",
         "",
-        f"Dataset path: {summary['dataset_path']}",
-        f"Total firm-year rows: {summary['row_count']:,}",
-        f"Distinct firms: {summary['distinct_firms']:,}",
-        f"Duplicate (firm_key, year) cells: {summary['duplicate_key_cells']:,}",
+        f"Parent-year input: {parent_year_path}",
+        f"Parent-occupation-year input: {parent_occ_path}",
+        f"Visibility source inspected: {visibility_panel_path if visibility_panel_path is not None else 'not configured'}",
         "",
-        "Recommended estimation windows:",
+        "Recommended estimation window:",
+        f"- Start year: {recommended_window['start_year']}",
+        f"- End year: {recommended_window['end_year']}",
+        f"- Basis: {recommended_window['basis']}",
+        "",
+        "Interpretation:",
+        "- The treatment timing should come from the parent-year PA-posting adoption panel, not the old firm-year panel.",
+        "- The outcome panel should remain at parent x occupation x year so the estimating variation is within parent-occupation cells over time.",
+        "- The visibility mechanism branch can use static occupation visibility from the safe-v3 monitoring-exposure panel even when the base parent-occupation panel does not carry those columns directly.",
+        "",
     ]
-    for key, values in recommended_windows.items():
-        lines.append(
-            f"- {key}: {values['start_year']} to {values['end_year']} ({values['basis']})"
-        )
+    if required_missing:
+        lines.append("Missing required outcome columns:")
+        for column in required_missing:
+            lines.append(f"- {column}")
+        lines.append("")
+    if optional_present:
+        lines.append("Optional five-year outcomes available:")
+        for column in optional_present:
+            lines.append(f"- {column}")
+        lines.append("")
 
-    flagged = year_flags[
-        year_flags["flag_invalid_calendar_year"]
-        | year_flags["flag_tiny_tail_year"]
-        | year_flags["flag_outside_main_window"]
-        | year_flags["flag_outside_posting_window"]
-    ].copy()
+    lines.append("Configured visibility variables:")
+    if selected_visibility:
+        for column in selected_visibility:
+            matches = candidate_frame.loc[candidate_frame["column_name"] == column, "source_dataset"].tolist()
+            source = matches[0] if matches else "missing_from_live_schema"
+            lines.append(f"- {column} ({source})")
+    else:
+        lines.append("- None selected.")
     lines.append("")
+
+    flagged = classified_years[
+        (~classified_years["valid_calendar_year"])
+        | classified_years["tiny_tail_year"]
+        | classified_years["outside_recommended_window"]
+    ].copy()
     lines.append("Flagged years:")
     if flagged.empty:
         lines.append("- No flagged years.")
     else:
         for _, row in flagged.sort_values("year").iterrows():
-            reasons = []
-            if row["flag_invalid_calendar_year"]:
+            reasons: list[str] = []
+            if not bool(row["valid_calendar_year"]):
                 reasons.append("invalid_calendar_year")
-            if row["flag_tiny_tail_year"]:
+            if bool(row["tiny_tail_year"]):
                 reasons.append("tiny_tail_year")
-            if row["flag_outside_main_window"]:
-                reasons.append("outside_main_window")
-            if row["flag_outside_posting_window"]:
-                reasons.append("outside_posting_window")
+            if bool(row["outside_recommended_window"]):
+                reasons.append("outside_recommended_window")
             lines.append(f"- {int(row['year'])}: {', '.join(reasons)}")
+    lines.append("")
+    lines.append("Key caution:")
+    lines.append("- hr_to_employee_ratio is excluded from event-study estimation because the current safe-v3 HR numerator is all zero.")
+    return "\n".join(lines) + "\n"
 
-    lines.append("")
-    lines.append("Firm coverage regimes:")
-    for _, row in firm_coverage.iterrows():
-        lines.append(f"- {row['coverage_regime']}: {int(row['firm_count']):,} firms")
-    lines.append("")
-    lines.append("Suggested first-pass restrictions:")
-    lines.append("- Exclude invalid year artifacts and tiny tail years automatically.")
-    lines.append("- Use the firm-level adoption year as the main treatment and treat position-based and posting-based definitions as robustness checks.")
-    lines.append("- Restrict posting-based event studies to the modern posting-support window rather than extrapolating into zero-coverage years.")
-    lines.append("- Re-check 2023 in the live panel before using it for estimation; the diagnostics indicate an anomalous end year relative to the 2020-2022 pattern.")
+
+def build_visibility_error_memo(
+    *,
+    parent_occ_path: Path,
+    visibility_panel_path: Path | None,
+    patterns: list[str],
+) -> str:
+    lines = [
+        "Visibility-interacted event-study inspection failed.",
+        "",
+        "No plausible visibility / exposure columns were found using the configured search patterns.",
+        f"Parent-occupation-year input inspected: {parent_occ_path}",
+        f"Visibility panel inspected: {visibility_panel_path if visibility_panel_path is not None else 'not configured'}",
+        f"Search patterns: {', '.join(patterns)}",
+        "",
+        "Action required:",
+        "- Either populate the base parent-occupation-year panel with predetermined visibility variables,",
+        "- or point the config to the correct companion visibility panel.",
+    ]
     return "\n".join(lines) + "\n"
 
 
 def main() -> None:
     args = parse_args()
     config = load_json(args.config_path)
-    paths = build_analysis_paths(args.project_root)
+    paths = build_analysis_paths(args.project_root, output_relative_root=config["output_relative_root"])
     ensure_analysis_directories(paths)
-
-    output_dir = Path(args.output_dir) if args.output_dir else paths.diagnostics_root / "input_inspection"
+    output_dir = Path(args.output_dir) if args.output_dir else paths.inspection_root
     ensure_directory(output_dir)
 
     logger = setup_logging("00_inspect_revelio_event_study_inputs", paths.logs_root)
-    dataset_path = Path(args.dataset_path) if args.dataset_path else default_dataset_path(args.project_root, config)
+    parent_year_dir = Path(args.parent_year_dir) if args.parent_year_dir else default_parent_year_path(args.project_root, config)
+    parent_occ_dir = Path(args.parent_occ_dir) if args.parent_occ_dir else default_parent_occ_path(args.project_root, config)
+    visibility_panel_dir = Path(args.visibility_panel_dir) if args.visibility_panel_dir else default_visibility_panel_path(args.project_root, config)
+    visibility_dir_exists = visibility_panel_dir.exists()
 
     spark = create_spark(
-        "revelio_event_study_input_inspection",
+        "inspect_parent_occ_event_study_inputs",
         shuffle_partitions=args.shuffle_partitions,
         tmpdir=args.tmpdir,
     )
 
-    logger.info("Reading dataset from %s", dataset_path)
-    df = spark.read.parquet(str(dataset_path))
+    logger.info("Reading parent-year panel from %s", parent_year_dir)
+    parent_year = spark.read.parquet(str(parent_year_dir))
+    logger.info("Reading parent-occupation-year panel from %s", parent_occ_dir)
+    parent_occ = spark.read.parquet(str(parent_occ_dir))
 
-    missing_required = sorted(set(REQUIRED_COLUMNS) - set(df.columns))
-    if missing_required:
-        raise ValueError(f"Dataset is missing required columns: {missing_required}")
+    missing_parent_year = sorted(set(PARENT_YEAR_REQUIRED) - set(parent_year.columns))
+    if missing_parent_year:
+        raise ValueError(f"Parent-year panel is missing required columns: {missing_parent_year}")
 
-    row_count = df.limit(1000000).count()  # capped diagnostic count
-    distinct_firms = df.select("firm_key").limit(1000000).distinct().limit(1000000).count()  # capped diagnostic count
-    duplicate_key_cells = (
-        df.groupBy("firm_key", "year")
-        .limit(1000000).count()  # capped diagnostic count
-        .where(F.col("count") > 1)
-        .limit(1000000).count()  # capped diagnostic count
-    )
+    required_outcome_cols = required_outcomes(config)
+    missing_parent_occ = sorted(set(PARENT_OCC_REQUIRED + required_outcome_cols) - set(parent_occ.columns))
+    if missing_parent_occ:
+        raise ValueError(f"Parent-occupation-year panel is missing required columns: {missing_parent_occ}")
 
-    year_summary = build_year_summary(df)
-    recommended = recommend_windows(year_summary, config, current_year=datetime.utcnow().year)
+    optional_outcome_cols = [column for column in optional_outcomes(config) if column in parent_occ.columns]
+
+    parent_year_rows_capped = parent_year.limit(args.sample_cap).count()
+    parent_occ_rows_capped = parent_occ.limit(args.sample_cap).count()
+    parent_year_dup_count, parent_year_dup_sample = approx_parent_year_duplicates(parent_year)
+    parent_occ_dup_count, parent_occ_dup_sample = approx_parent_occ_duplicates(parent_occ, args.sample_cap)
+
+    parent_year_summary = build_parent_year_summary(parent_year)
+    parent_occ_summary, parent_occ_nonmissing = build_parent_occ_summary(parent_occ, required_outcome_cols + optional_outcome_cols)
+    year_frame = build_joint_year_frame(parent_year_summary, parent_occ_summary)
+    recommended = recommend_estimation_window(year_frame, config, current_year=datetime.utcnow().year)
     classified_years = recommended["classified_years"].copy()
-    windows = recommended["recommended_windows"]
+    window = recommended["recommended_window"]
 
-    classified_years["flag_invalid_calendar_year"] = ~classified_years["valid_calendar_year"]
-    classified_years["flag_tiny_tail_year"] = classified_years["tiny_tail_year"]
-    classified_years["flag_outside_main_window"] = (
-        (classified_years["year"] < windows["main"]["start_year"])
-        | (classified_years["year"] > windows["main"]["end_year"])
-    )
-    classified_years["flag_outside_posting_window"] = (
-        (classified_years["year"] < windows["posting"]["start_year"])
-        | (classified_years["year"] > windows["posting"]["end_year"])
-    )
+    parent_timing_distribution = build_parent_timing_distribution(parent_year)
+    timing_consistency = build_parent_timing_consistency(parent_year)
+    outcome_presence = build_outcome_presence(parent_occ, config)
 
-    adoption_counts = classified_years[
-        ["year", "main_adoptions", "position_adoptions", "posting_adoptions"]
-    ].copy()
-    first_treat_tables = []
-    first_treat_tables.append(
-        build_first_treat_distribution(df, "first_people_analytics_firm_year_any_enriched", "main")
-    )
-    first_treat_tables.append(
-        build_first_treat_distribution(df, "first_people_analytics_position_year_any_enriched", "position")
-    )
-    first_treat_tables.append(
-        build_first_treat_distribution(df, "first_people_analytics_posting_year_any_enriched", "posting")
-    )
-    first_treat_distribution = pd.concat(first_treat_tables, ignore_index=True)
-    firm_coverage = build_firm_coverage_regime(df)
-    profile = missing_profile(df, [column for column in PROFILE_COLUMNS if column in df.columns])
+    optional_present = outcome_presence.loc[(outcome_presence["optional"] == True) & (outcome_presence["present"] == 1), "outcome"].tolist()
+    required_missing = outcome_presence.loc[(outcome_presence["optional"] == False) & (outcome_presence["present"] == 0), "outcome"].tolist()
 
-    summary = {
-        "dataset_path": str(dataset_path),
-        "row_count": int(row_count),
-        "distinct_firms": int(distinct_firms),
-        "duplicate_key_cells": int(duplicate_key_cells),
-        "recommended_windows": windows,
+    patterns = visibility_candidate_patterns(config)
+    parent_occ_candidates = candidate_visibility_columns(parent_occ.columns, patterns)
+    candidate_frames = [build_candidate_profile(parent_occ, parent_occ_candidates, args.sample_cap, "parent_occ_panel")]
+
+    visibility_panel = None
+    visibility_panel_candidates: list[str] = []
+    if visibility_dir_exists:
+        logger.info("Reading visibility companion panel from %s", visibility_panel_dir)
+        visibility_panel = spark.read.parquet(str(visibility_panel_dir))
+        visibility_panel_candidates = candidate_visibility_columns(visibility_panel.columns, patterns)
+        candidate_frames.append(build_candidate_profile(visibility_panel, visibility_panel_candidates, args.sample_cap, "visibility_panel"))
+
+    candidate_frame = (
+        pd.concat(candidate_frames, ignore_index=True)
+        if candidate_frames
+        else pd.DataFrame(columns=["source_dataset", "column_name", "dtype", "n_nonmissing", "n_distinct_approx", "mean", "sd", "min", "max"])
+    )
+    candidate_frame = candidate_frame.sort_values(["source_dataset", "column_name"]).reset_index(drop=True)
+
+    configured_visibility = configured_visibility_variables(config)
+    configured_names = [item["name"] for item in configured_visibility]
+    available_columns = set(parent_occ_candidates) | set(visibility_panel_candidates)
+    selected_visibility = [name for name in configured_names if name in available_columns]
+
+    metadata = {
+        "parent_year_dir": str(parent_year_dir),
+        "parent_occ_dir": str(parent_occ_dir),
+        "visibility_panel_dir": str(visibility_panel_dir) if visibility_dir_exists else None,
+        "output_dir": str(output_dir),
+        "treatment_first_year_column": config["treatment"]["first_treat_col"],
+        "required_outcomes": required_outcome_cols,
+        "optional_outcomes_present": optional_present,
+        "visibility_variables_configured": configured_names,
+        "visibility_variables_found": selected_visibility,
+        "event_time_window": {
+            "bin_min": config["event_time"]["bin_min"],
+            "bin_max": config["event_time"]["bin_max"],
+            "omit_event_time": config["event_time"]["omit_event_time"],
+        },
+        "parent_year_rows_capped": int(parent_year_rows_capped),
+        "parent_occ_rows_capped": int(parent_occ_rows_capped),
+        "parent_year_duplicate_key_probe_count": int(parent_year_dup_count),
+        "parent_occ_duplicate_key_probe_count": int(parent_occ_dup_count),
+        "recommended_window": window,
+        "cluster_var": config["metadata"]["cluster_var"],
+        "baseline_fixed_effects": [
+            config["metadata"]["baseline_unit_fe"],
+            config["metadata"]["baseline_time_fe"],
+        ],
     }
 
-    memo = build_memo(summary, windows, classified_years, firm_coverage)
+    write_json(metadata, output_dir / "00_metadata.json")
+    write_pandas_csv(parent_year_summary, output_dir / "01_parent_year_summary_by_year.csv")
+    write_pandas_csv(parent_occ_summary, output_dir / "02_parent_occ_summary_by_year.csv")
+    write_pandas_csv(classified_years, output_dir / "03_joint_year_classification.csv")
+    write_pandas_csv(parent_timing_distribution, output_dir / "04_parent_adoption_cohorts.csv")
+    write_pandas_csv(parent_occ_nonmissing, output_dir / "05_outcome_nonmissing_counts.csv")
+    write_pandas_csv(outcome_presence, output_dir / "06_outcome_presence.csv")
+    write_pandas_csv(parent_year_dup_sample, output_dir / "07_parent_year_duplicate_probe.csv")
+    write_pandas_csv(parent_occ_dup_sample, output_dir / "08_parent_occ_duplicate_probe.csv")
+    write_pandas_csv(timing_consistency, output_dir / "09_parent_timing_inconsistencies.csv")
+    write_json(window, output_dir / "10_recommended_window.json")
+    write_pandas_csv(candidate_frame, output_dir / "12_visibility_candidate_columns.csv")
 
-    write_json(summary, output_dir / "00_inspection_summary.json")
-    write_pandas_csv(year_summary, output_dir / "01_year_summary.csv")
-    write_pandas_csv(classified_years, output_dir / "02_year_classification.csv")
-    write_pandas_csv(adoption_counts, output_dir / "03_adoption_counts_by_year.csv")
-    write_pandas_csv(first_treat_distribution, output_dir / "04_first_treat_distributions.csv")
-    write_pandas_csv(firm_coverage, output_dir / "05_firm_coverage_regimes.csv")
-    write_pandas_csv(profile, output_dir / "06_missingness_profile.csv")
-    write_json(windows, output_dir / "07_recommended_estimation_windows.json")
-    write_text(memo, output_dir / "08_suggested_restrictions_memo.txt")
+    if candidate_frame.empty:
+        error_memo = build_visibility_error_memo(
+            parent_occ_path=parent_occ_dir,
+            visibility_panel_path=visibility_panel_dir if visibility_dir_exists else None,
+            patterns=patterns,
+        )
+        write_text(error_memo, output_dir / "13_visibility_candidate_memo.txt")
+        spark.stop()
+        raise RuntimeError("No plausible visibility/exposure columns found. See inspection/13_visibility_candidate_memo.txt")
+
+    memo = build_memo(
+        parent_year_path=parent_year_dir,
+        parent_occ_path=parent_occ_dir,
+        visibility_panel_path=visibility_panel_dir if visibility_dir_exists else None,
+        recommended_window=window,
+        classified_years=classified_years,
+        optional_present=optional_present,
+        required_missing=required_missing,
+        selected_visibility=selected_visibility,
+        candidate_frame=candidate_frame,
+    )
+    write_text(memo, output_dir / "11_inspection_memo.txt")
+    write_text(
+        "Visibility candidates were searched first in the base parent-occupation-year panel and then in the configured visibility companion panel.\n",
+        output_dir / "13_visibility_candidate_memo.txt",
+    )
+
+    if not selected_visibility:
+        spark.stop()
+        raise RuntimeError(
+            "Configured visibility variables were not found in the live schemas. "
+            "See inspection/12_visibility_candidate_columns.csv and inspection/13_visibility_candidate_memo.txt."
+        )
 
     logger.info("Inspection complete. Outputs written to %s", output_dir)
     spark.stop()

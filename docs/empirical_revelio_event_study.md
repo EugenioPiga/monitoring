@@ -1,210 +1,270 @@
-# Empirical Revelio Event Study
+# Parent-Occupation Event Study: Safe-v3
 
-This section organizes a first-pass empirical pipeline for firm-level adoption of people analytics or prediction technology in Revelio firm-year data. The starting panel is:
+This event-study pipeline is built for the safe-v3 Revelio branch that uses:
 
-- `/labs/khanna/predictive_capital/revelio_people_analytics/processed/final/firm_year_panel`
+- parent-year adoption timing from `processed/final/parent_year_first_pass_paonly_safe_v3`
+- parent x occupation x year outcomes from `processed/final/parent_occupation_year_panel_paonly_safe_v3`
+- visibility inputs from `processed/final/monitoring_exposure_parent_occ_year_paonly_safe_v3` when the mechanism branch is enabled
 
-The code is written to follow the existing project style:
+It deliberately does **not** use the older `processed/final/firm_year_panel` event-study setup.
 
-- standalone CLI scripts
-- explicit paths
-- Spark-friendly prep and diagnostics
-- sbatch wrappers for cluster execution
+## Treatment
 
-## Treatment Definitions
+The treatment is parent-level adoption of people-analytics postings:
 
-The pipeline estimates three adoption definitions.
+- `T_p = first_people_analytics_posting_year_any_enriched`
 
-- Main treatment: `first_people_analytics_firm_year_any_enriched`
-  This is the preferred firm-level adoption event because it combines position-side and posting-side signals.
-- Position treatment: `first_people_analytics_position_year_any_enriched`
-  This is the long-run backbone of the panel and the main robustness definition when posting support is thin.
-- Posting treatment: `first_people_analytics_posting_year_any_enriched`
-  This is the modern robustness definition when posting coverage is meaningfully present.
+Each parent x occupation cell inherits the same parent-level treatment year.
 
-For each treatment, the sample builder creates:
+## Outcomes
 
-- `event_time`
-- `ever_treated`
-- `never_treated`
-- `not_yet_treated`
-- `post`
-- balanced-treated indicators
-- treatment-specific analysis-row flags
-- treatment-specific binned event times based on support
-
-## Main Outcomes
-
-Primary outcomes are prioritized around decisions, composition, and organizational change.
+Baseline outcomes:
 
 - `exit_rate`
 - `hire_rate`
-- `log_workforce`
-- `workforce_growth`
-- `avg_seniority`
-- `data_analytics_role_share`
-- `hr_people_role_share`
-- `workers_with_hr_technology_skill_share`
-- `workers_with_employee_feedback_tool_skill_share`
+- `promotion_rate`
+- `promotion_rate_continuers`
+- `skill_count_sd`
+- `skill_hhi_mean`
+- `specialist_share`
+- `skill_bundle_dispersion`
+- `managers_to_employee_ratio`
 
-Secondary outcomes are still estimated but are not the economic center of the first pass.
+Optional five-year outcomes are included only if they exist and are nonmissing:
 
-- `avg_salary`
-- `avg_start_salary`
-- `avg_end_salary`
-- `posting_count`
-- `log_posting_count`
-- `avg_posting_salary`
-- `people_analytics_positions_any_enriched_share`
-- `people_analytics_postings_any_enriched_share`
+- `d5_exit_rate`
+- `d5_hire_rate`
+- `d5_skill_count_sd`
+- `d5_skill_bundle_dispersion`
+- `d5_skill_hhi_mean`
+- `d5_specialist_share`
 
-## Sample Restrictions
+Excluded:
 
-The code does not hardcode one fixed sample mechanically. It diagnoses the live panel and writes out the restriction logic before estimation.
+- `hr_to_employee_ratio`
 
-Current seeded defaults from the provided diagnostics are:
+That variable is currently excluded because the safe-v3 HR numerator is all zero.
 
-- Main and position windows: `2010-2022`
-- Posting window: `2017-2022`
+## Baseline Design
 
-Those defaults are only fallbacks. The inspection step recomputes year support from the actual panel and updates the recommended windows automatically.
+The baseline event study is estimated on parent x occupation x year observations:
 
-The first-pass restriction logic is:
+`y_{p,o,t} = sum_{k != -1} beta_k 1[t - T_p = k] + alpha_{p,o} + gamma_{o,t} + epsilon_{p,o,t}`
 
-- drop rows with missing `firm_key` or `year`
-- drop invalid year artifacts and tiny tail years
-- trim to the common estimation horizon implied by the inspection output
-- require treated cohorts to have at least `3` pre-period observations and `2` post-period observations by default
-- keep late-treated firms as controls before their own treatment rather than forcing them into treated cohorts
-- exclude already-treated cohorts that enter the trimmed window without enough pre-period support
-- choose the event-study bin width from `{5, 4, 3, 2}` based on observed support in treated event-time cells
-- keep a stronger both-sources restriction for Spec 3 only
+where:
 
-The scripts also save:
+- `alpha_{p,o}` is a parent x occupation fixed effect
+- `gamma_{o,t}` is an occupation x calendar-year fixed effect
+- the omitted event time is `k = -1`
+- standard errors are clustered by `parent_rcid`
 
-- a row-level restriction report
-- treatment-level cohort eligibility tables
-- event-time support tables
-- recommended windows and flagged years
+Why not parent x year fixed effects?
 
-## Estimation Design
+- Treatment timing varies at the parent-year level.
+- Parent x year fixed effects would absorb the treatment event-time variation directly.
 
-Baseline estimation uses dynamic TWFE event studies with:
+Why parent x occupation FE and occupation x year FE?
 
-- firm fixed effects
-- year fixed effects
-- omitted event time `-1`
-- firm-level clustered standard errors
+- Parent x occupation FE absorb persistent differences in the workforce structure of each parent-occupation cell.
+- Occupation x year FE absorb broad labor-market shocks that hit occupations nationally over time.
 
-Implemented baseline specifications:
+## Event-Time Construction
 
-- Spec 1: firm FE + year FE
-- Spec 2: firm FE + year FE + NAICS2-by-year fixed effects
-- Spec 3: Spec 1 on firm-years with both position and posting coverage
-- Spec 4a: position-based treatment
-- Spec 4b: posting-based treatment
+Raw event time:
 
-Advanced design:
+- `event_time_raw = year - first_people_analytics_posting_year_any_enriched`
 
-- Sun-Abraham style event study through `fixest::sunab(...)` for primary outcomes under the main treatment
-- this runs when `--run-advanced` is passed and the required R packages are available
+Binning:
 
-## Heterogeneity
+- `event_time_raw <= -6` becomes `-6`
+- `event_time_raw >= 6` becomes `6`
+- retain `-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5`
+- omit `-1` in estimation
 
-The sample builder creates splits for:
+The estimated coefficients are therefore reported for:
 
-- public vs non-public firms
-- large vs small firms using baseline workforce
-- data-intensive vs less data-intensive firms using pre-adoption skill intensity
+- `-6, -5, -4, -3, -2, 0, 1, 2, 3, 4, 5, 6`
 
-Optional heterogeneity regressions can be launched in the estimation step with `--run-heterogeneity`.
+## Staggered Adoption
+
+Two estimators are produced.
+
+1. TWFE first pass
+
+- parent x occupation FE
+- occupation x year FE
+- clustered by parent
+
+This is useful for transparent first-pass plots, but it can be contaminated under staggered adoption.
+
+2. Stacked not-yet-treated design
+
+- cohorts are defined by the parent-level first adoption year
+- for cohort `g`, treated parents satisfy `T_p = g`
+- controls are never-treated parents or parents with `T_p > g + 6`
+- the stacked sample keeps years `g - 6` through `g + 6`
+- fixed effects are:
+  - `cohort x parent x occupation`
+  - `cohort x occupation x year`
+- standard errors are still clustered by `parent_rcid`
+
+This stacked estimator is the cleaner design in the presence of staggered adoption.
+
+## Visibility-Interacted Event-Study Design
+
+The baseline event study above estimates the **average** effect of parent-level PA adoption on parent x occupation x year outcomes.
+
+The visibility-interacted branch estimates whether those effects are larger in occupations that are more visible or monitorable within the same parent-year.
+
+The preferred mechanism specification is:
+
+`y_{p,o,t} = sum_{k != -1} theta_k [1[t - T_p = k] x Visibility_o] + alpha_{p,o} + delta_{p,t} + gamma_{o,t} + epsilon_{p,o,t}`
+
+where:
+
+- `alpha_{p,o}` is a parent x occupation fixed effect
+- `delta_{p,t}` is a parent x year fixed effect
+- `gamma_{o,t}` is an occupation x year fixed effect
+- the omitted event time is `k = -1`
+- standard errors are clustered by `parent_rcid`
+
+Why does this design include parent x year fixed effects?
+
+- Parent-level PA adoption occurs at the parent-year level.
+- Once parent x year fixed effects are included, all uninteracted parent-level event-time shocks are absorbed.
+- Identification therefore comes only from comparing more visible and less visible occupations **within the same parent-year** around adoption.
+
+That is the correct design for the monitoring / visibility mechanism.
+
+The coefficient at event time `k` should be interpreted as:
+
+- the differential effect of PA adoption for a 1 standard deviation increase in visibility,
+- relative to event time `-1`,
+- holding fixed the parent-year shock common to all occupations inside the parent.
+
+Visibility variables are standardized inside the estimation sample:
+
+- `visibility_std = (visibility - mean) / sd`
+
+The pipeline also creates `high` / `low` visibility indicators using the median among nonmissing occupation-level observations. Those are used only for descriptive tables, not as the preferred regression design.
+
+Default safe-v3 visibility variables:
+
+- `occ_visibility_internal_static`
+- `occ_visibility_external_static`
+
+The inspection step searches live schemas first and writes `inspection/12_visibility_candidate_columns.csv` before the visibility branch is built.
 
 ## Output Layout
 
-Expected outputs are written under:
+Outputs are written to:
 
-- `processed/analysis/diagnostics/input_inspection/`
-- `processed/analysis/diagnostics/event_study_sample/`
-- `processed/analysis/samples/revelio_event_study_sample.parquet`
-- `processed/analysis/event_study/results/`
-- `processed/analysis/event_study/quicklook/`
-- `processed/analysis/event_study/notes/`
-- `processed/analysis/figures/event_study/`
-- `processed/analysis/tables/event_study_sample/`
-- `processed/analysis/tables/event_study_summary/`
+- `processed/final/event_studies_pa_posting_parent_occ_safe_v3/inspection`
+- `processed/final/event_studies_pa_posting_parent_occ_safe_v3/sample`
+- `processed/final/event_studies_pa_posting_parent_occ_safe_v3/results`
+- `processed/final/event_studies_pa_posting_parent_occ_safe_v3/figures`
+- `processed/final/event_studies_pa_posting_parent_occ_safe_v3/tables`
+- `processed/final/event_studies_pa_posting_parent_occ_safe_v3/visibility_sample`
+- `processed/final/event_studies_pa_posting_parent_occ_safe_v3/visibility_results`
+- `processed/final/event_studies_pa_posting_parent_occ_safe_v3/visibility_figures`
+- `processed/final/event_studies_pa_posting_parent_occ_safe_v3/visibility_tables`
 
 ## Run Order
 
-1. Inspect the panel inputs.
-2. Build the cleaned event-study sample.
-3. Estimate event studies.
-4. Build publication-ready figures.
-5. Build summary tables.
+1. Inspect the parent-year and parent-occupation-year inputs.
+2. Build the joined event-study sample.
+3. Estimate TWFE and stacked event studies.
+4. Plot the coefficient paths.
+5. Build compact diagnostics tables.
+6. Estimate the visibility-interacted TWFE and stacked event studies.
+7. Plot the visibility-interacted coefficients.
+8. Build compact visibility summary tables.
 
-## Direct Python Commands
-
-Run these from `/labs/khanna/predictive_capital/revelio_people_analytics`.
+## Direct Commands
 
 ```bash
 python code/analysis/00_inspect_revelio_event_study_inputs.py \
   --project-root /labs/khanna/predictive_capital/revelio_people_analytics \
-  --dataset-path /labs/khanna/predictive_capital/revelio_people_analytics/processed/final/firm_year_panel
+  --parent-year-dir /labs/khanna/predictive_capital/revelio_people_analytics/processed/final/parent_year_first_pass_paonly_safe_v3 \
+  --parent-occ-dir /labs/khanna/predictive_capital/revelio_people_analytics/processed/final/parent_occupation_year_panel_paonly_safe_v3
 ```
 
 ```bash
 python code/analysis/01_build_event_study_sample.py \
   --project-root /labs/khanna/predictive_capital/revelio_people_analytics \
-  --dataset-path /labs/khanna/predictive_capital/revelio_people_analytics/processed/final/firm_year_panel \
-  --inspection-dir /labs/khanna/predictive_capital/revelio_people_analytics/processed/analysis/diagnostics/input_inspection \
-  --output-dir /labs/khanna/predictive_capital/revelio_people_analytics/processed/analysis/samples/revelio_event_study_sample.parquet
+  --parent-year-dir /labs/khanna/predictive_capital/revelio_people_analytics/processed/final/parent_year_first_pass_paonly_safe_v3 \
+  --parent-occ-dir /labs/khanna/predictive_capital/revelio_people_analytics/processed/final/parent_occupation_year_panel_paonly_safe_v3 \
+  --visibility-panel-dir /labs/khanna/predictive_capital/revelio_people_analytics/processed/final/monitoring_exposure_parent_occ_year_paonly_safe_v3
 ```
 
 ```bash
 python code/analysis/02_estimate_event_studies.py \
   --project-root /labs/khanna/predictive_capital/revelio_people_analytics \
-  --sample-path /labs/khanna/predictive_capital/revelio_people_analytics/processed/analysis/samples/revelio_event_study_sample.parquet \
-  --output-dir /labs/khanna/predictive_capital/revelio_people_analytics/processed/analysis/event_study \
-  --run-advanced
+  --run-base 1 \
+  --run-stacked 1
 ```
 
 ```bash
-python code/analysis/03_make_event_study_figures.py \
+python code/analysis/02_estimate_event_studies.py \
   --project-root /labs/khanna/predictive_capital/revelio_people_analytics \
-  --results-dir /labs/khanna/predictive_capital/revelio_people_analytics/processed/analysis/event_study/results \
-  --output-dir /labs/khanna/predictive_capital/revelio_people_analytics/processed/analysis/figures/event_study
+  --visibility-sample-dir /labs/khanna/predictive_capital/revelio_people_analytics/processed/final/event_studies_pa_posting_parent_occ_safe_v3/visibility_sample \
+  --run-base 0 \
+  --run-stacked 0 \
+  --run-visibility 1 \
+  --run-visibility-stacked 1
 ```
 
 ```bash
-python code/analysis/04_make_summary_tables.py \
+python code/plotting/03_make_event_study_figures.py \
   --project-root /labs/khanna/predictive_capital/revelio_people_analytics \
-  --sample-path /labs/khanna/predictive_capital/revelio_people_analytics/processed/analysis/samples/revelio_event_study_sample.parquet \
-  --output-dir /labs/khanna/predictive_capital/revelio_people_analytics/processed/analysis/tables/event_study_summary
+  --mode both
+```
+
+```bash
+python code/analysis/04_make_event_study_tables.py \
+  --project-root /labs/khanna/predictive_capital/revelio_people_analytics \
+  --mode both
 ```
 
 ## Sbatch Commands
 
-```bash
-sbatch sbatch/run_00_inspect_revelio_event_study_inputs.sbatch
-sbatch sbatch/run_01_build_event_study_sample.sbatch
-sbatch sbatch/run_02_estimate_event_studies.sbatch
-sbatch sbatch/run_03_make_event_study_figures.sbatch
-sbatch sbatch/run_04_make_summary_tables.sbatch
-```
-
-Submit the dependency chain with:
+Run the full base + visibility pipeline:
 
 ```bash
+cd /labs/khanna/predictive_capital/revelio_people_analytics
 bash sbatch/run_full_revelio_event_study_pipeline.sh
 ```
 
-## R Dependencies
+Run the visibility branch only after the sample already exists:
 
-The estimation backend requires:
+```bash
+cd /labs/khanna/predictive_capital/revelio_people_analytics
+sbatch sbatch/run_05_estimate_visibility_event_studies.sbatch
+sbatch sbatch/run_06_make_visibility_event_study_figures.sbatch
+sbatch sbatch/run_07_make_visibility_summary_tables.sbatch
+```
 
-- `fixest`
-- `data.table`
-- `arrow`
-- `dplyr`
-- `jsonlite`
+## Validate Outputs
 
-If `Rscript` or those packages are missing, the Python estimation entrypoint fails loudly and records the run manifest so the missing dependency is explicit.
+Start with:
+
+- `inspection/10_recommended_window.json`
+- `sample/01_adoption_cohort_counts.csv`
+- `sample/02_event_time_support.csv`
+- `results/02_event_study_coefficients.csv`
+- `results/03_pretrend_summary.csv`
+- `figures/event_study_appendix.pdf`
+- `tables/01_estimator_summary.csv`
+- `inspection/12_visibility_candidate_columns.csv`
+- `visibility_sample/01_visibility_variable_summary.csv`
+- `visibility_results/02_visibility_event_study_coefficients.csv`
+- `visibility_results/03_visibility_pretrend_summary.csv`
+- `visibility_figures/visibility_event_study_appendix.pdf`
+- `visibility_tables/01_visibility_estimator_summary.csv`
+
+If the stacked estimator is skipped, check:
+
+- `results/05_model_status.csv`
+- `visibility_results/04_visibility_model_status.csv`
+
+for the exact reason, typically missing stacked parquet support or disabled execution.

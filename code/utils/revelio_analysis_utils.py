@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,12 +20,16 @@ class AnalysisPaths:
     docs_root: Path
     logs_root: Path
     processed_root: Path
-    processed_analysis_root: Path
-    samples_root: Path
-    event_study_root: Path
-    tables_root: Path
+    output_root: Path
+    inspection_root: Path
+    sample_root: Path
+    results_root: Path
     figures_root: Path
-    diagnostics_root: Path
+    tables_root: Path
+    visibility_sample_root: Path
+    visibility_results_root: Path
+    visibility_figures_root: Path
+    visibility_tables_root: Path
 
 
 def bootstrap_code_path(project_root: str | Path | None = None) -> Path:
@@ -38,10 +43,25 @@ def bootstrap_code_path(project_root: str | Path | None = None) -> Path:
     return code_root
 
 
-def build_analysis_paths(project_root: str | Path) -> AnalysisPaths:
+def ensure_directory(path: str | Path) -> Path:
+    resolved = Path(path)
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
+
+
+def load_json(path: str | Path) -> Any:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def build_analysis_paths(
+    project_root: str | Path,
+    *,
+    output_relative_root: str = "processed/final/event_studies_pa_posting_parent_occ_safe_v3",
+) -> AnalysisPaths:
     root = Path(project_root).resolve()
     processed_root = root / "processed"
-    processed_analysis_root = processed_root / "analysis"
+    output_root = root / output_relative_root
     return AnalysisPaths(
         project_root=root,
         code_root=root / "code",
@@ -49,19 +69,17 @@ def build_analysis_paths(project_root: str | Path) -> AnalysisPaths:
         docs_root=root / "docs",
         logs_root=root / "logs",
         processed_root=processed_root,
-        processed_analysis_root=processed_analysis_root,
-        samples_root=processed_analysis_root / "samples",
-        event_study_root=processed_analysis_root / "event_study",
-        tables_root=processed_analysis_root / "tables",
-        figures_root=processed_analysis_root / "figures",
-        diagnostics_root=processed_analysis_root / "diagnostics",
+        output_root=output_root,
+        inspection_root=output_root / "inspection",
+        sample_root=output_root / "sample",
+        results_root=output_root / "results",
+        figures_root=output_root / "figures",
+        tables_root=output_root / "tables",
+        visibility_sample_root=output_root / "visibility_sample",
+        visibility_results_root=output_root / "visibility_results",
+        visibility_figures_root=output_root / "visibility_figures",
+        visibility_tables_root=output_root / "visibility_tables",
     )
-
-
-def ensure_directory(path: str | Path) -> Path:
-    resolved = Path(path)
-    resolved.mkdir(parents=True, exist_ok=True)
-    return resolved
 
 
 def ensure_analysis_directories(paths: AnalysisPaths) -> None:
@@ -69,17 +87,20 @@ def ensure_analysis_directories(paths: AnalysisPaths) -> None:
         paths.code_root / "analysis",
         paths.code_root / "utils",
         paths.code_root / "plotting",
-        paths.code_root / "archive",
         paths.configs_root,
         paths.docs_root,
         paths.logs_root,
         paths.processed_root,
-        paths.processed_analysis_root,
-        paths.samples_root,
-        paths.event_study_root,
-        paths.tables_root,
+        paths.output_root,
+        paths.inspection_root,
+        paths.sample_root,
+        paths.results_root,
         paths.figures_root,
-        paths.diagnostics_root,
+        paths.tables_root,
+        paths.visibility_sample_root,
+        paths.visibility_results_root,
+        paths.visibility_figures_root,
+        paths.visibility_tables_root,
     ]:
         ensure_directory(path)
 
@@ -105,16 +126,11 @@ def setup_logging(script_name: str, log_dir: str | Path) -> logging.Logger:
     return logger
 
 
-def load_json(path: str | Path) -> Any:
-    with Path(path).open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
 def write_json(obj: Any, path: str | Path) -> None:
     output_path = Path(path)
     ensure_directory(output_path.parent)
     with output_path.open("w", encoding="utf-8") as handle:
-        json.dump(obj, handle, indent=2, sort_keys=True)
+        json.dump(obj, handle, indent=2, sort_keys=True, default=_json_default)
 
 
 def write_text(text: str, path: str | Path) -> None:
@@ -127,6 +143,12 @@ def write_pandas_csv(frame: pd.DataFrame, path: str | Path, index: bool = False)
     output_path = Path(path)
     ensure_directory(output_path.parent)
     frame.to_csv(output_path, index=index)
+
+
+def write_pandas_latex(frame: pd.DataFrame, path: str | Path, *, index: bool = False, float_format: str = "%.4f") -> None:
+    output_path = Path(path)
+    ensure_directory(output_path.parent)
+    output_path.write_text(frame.to_latex(index=index, float_format=float_format), encoding="utf-8")
 
 
 def create_spark(
@@ -181,13 +203,6 @@ def year_from_any(value: Any) -> int | None:
         return None
 
 
-def extract_naics_digits(column, digits: int = 2):
-    from pyspark.sql import functions as F
-
-    cleaned = F.regexp_extract(F.coalesce(column.cast("string"), F.lit("")), r"([0-9]+)", 1)
-    return F.when(F.length(cleaned) >= digits, F.substring(cleaned, 1, digits))
-
-
 def append_restriction(
     records: list[dict[str, Any]],
     *,
@@ -238,8 +253,6 @@ def write_restriction_outputs(records: list[dict[str, Any]], csv_path: str | Pat
 
 
 def call_subprocess(command: list[str], logger: logging.Logger, env: dict[str, str] | None = None) -> None:
-    import subprocess
-
     logger.info("Launching command: %s", " ".join(command))
     completed = subprocess.run(command, check=False, capture_output=True, text=True, env=env)
     if completed.stdout:
@@ -252,24 +265,23 @@ def call_subprocess(command: list[str], logger: logging.Logger, env: dict[str, s
         raise RuntimeError(f"Command failed with exit code {completed.returncode}: {' '.join(command)}")
 
 
-def file_exists(path: str | Path) -> bool:
-    return Path(path).exists()
-
-
-def default_dataset_path(project_root: str | Path, config: dict[str, Any]) -> Path:
-    relative_path = config.get("dataset_relative_path", "processed/final/firm_year_panel")
+def default_parent_year_path(project_root: str | Path, config: dict[str, Any]) -> Path:
+    relative_path = config.get("parent_year_relative_path", "processed/final/parent_year_first_pass_paonly_safe_v3")
     return Path(project_root).resolve() / relative_path
 
 
-def as_bool_flag(value: str | None, default: bool = False) -> bool:
-    if value is None:
-        return default
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "t", "yes", "y"}:
-        return True
-    if normalized in {"0", "false", "f", "no", "n"}:
-        return False
-    return default
+def default_parent_occ_path(project_root: str | Path, config: dict[str, Any]) -> Path:
+    relative_path = config.get("parent_occ_relative_path", "processed/final/parent_occupation_year_panel_paonly_safe_v3")
+    return Path(project_root).resolve() / relative_path
+
+
+def default_visibility_panel_path(project_root: str | Path, config: dict[str, Any]) -> Path:
+    settings = config.get("visibility_event_studies", {})
+    relative_path = settings.get(
+        "visibility_panel_relative_path",
+        "processed/final/monitoring_exposure_parent_occ_year_paonly_safe_v3",
+    )
+    return Path(project_root).resolve() / relative_path
 
 
 def slurm_threads(default: int) -> int:
@@ -280,3 +292,11 @@ def slurm_threads(default: int) -> int:
         return max(1, int(raw))
     except ValueError:
         return default
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "item"):
+        return value.item()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=evt_paocc_01
-#SBATCH --output=logs/evt_paocc_01_%j.out
-#SBATCH --error=logs/evt_paocc_01_%j.err
-#SBATCH --time=08:00:00
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=128G
+#SBATCH --job-name=evt_paocc_07
+#SBATCH --output=logs/evt_paocc_07_%j.out
+#SBATCH --error=logs/evt_paocc_07_%j.err
+#SBATCH --time=03:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
 #SBATCH --partition=general
 
 set -euo pipefail
@@ -13,12 +13,11 @@ PROJECT_ROOT="${PROJECT_ROOT:-/labs/khanna/predictive_capital/revelio_people_ana
 CODE_DIR="$PROJECT_ROOT/code"
 LOG_DIR="$PROJECT_ROOT/logs"
 CONFIG_PATH="${CONFIG_PATH:-$PROJECT_ROOT/configs/revelio_event_study_config.json}"
-PARENT_YEAR_DIR="${PARENT_YEAR_DIR:-$PROJECT_ROOT/processed/final/parent_year_first_pass_paonly_safe_v3}"
-PARENT_OCC_DIR="${PARENT_OCC_DIR:-$PROJECT_ROOT/processed/final/parent_occupation_year_panel_paonly_safe_v3}"
-VISIBILITY_PANEL_DIR="${VISIBILITY_PANEL_DIR:-$PROJECT_ROOT/processed/final/monitoring_exposure_parent_occ_year_paonly_safe_v3}"
-INSPECTION_DIR="${INSPECTION_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/inspection}"
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/sample}"
-VISIBILITY_OUTPUT_DIR="${VISIBILITY_OUTPUT_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/visibility_sample}"
+SAMPLE_DIR="${SAMPLE_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/sample}"
+RESULTS_DIR="${RESULTS_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/results}"
+VISIBILITY_SAMPLE_DIR="${VISIBILITY_SAMPLE_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/visibility_sample}"
+VISIBILITY_RESULTS_DIR="${VISIBILITY_RESULTS_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/visibility_results}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/visibility_tables}"
 SPARK_BASE_DIR="${SPARK_BASE_DIR:-/labs/khanna/predictive_capital/scratch/revelio_event_study/${USER}}"
 JOB_SCRATCH="$SPARK_BASE_DIR/${SLURM_JOB_ID}"
 
@@ -51,10 +50,10 @@ export PYSPARK_PYTHON="$(which python)"
 export PYSPARK_DRIVER_PYTHON="$(which python)"
 
 export PYSPARK_SUBMIT_ARGS="\
---conf spark.driver.memory=96g \
---conf spark.driver.maxResultSize=8g \
---conf spark.sql.shuffle.partitions=1600 \
---conf spark.default.parallelism=1600 \
+--conf spark.driver.memory=20g \
+--conf spark.driver.maxResultSize=4g \
+--conf spark.sql.shuffle.partitions=400 \
+--conf spark.default.parallelism=400 \
 --conf spark.sql.files.maxPartitionBytes=134217728 \
 --conf spark.sql.adaptive.enabled=true \
 --conf spark.sql.adaptive.coalescePartitions.enabled=false \
@@ -65,21 +64,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-python -u "$CODE_DIR/analysis/01_build_event_study_sample.py" \
+python -u "$CODE_DIR/analysis/04_make_event_study_tables.py" \
   --project-root "$PROJECT_ROOT" \
-  --parent-year-dir "$PARENT_YEAR_DIR" \
-  --parent-occ-dir "$PARENT_OCC_DIR" \
-  --visibility-panel-dir "$VISIBILITY_PANEL_DIR" \
-  --inspection-dir "$INSPECTION_DIR" \
-  --output-dir "$OUTPUT_DIR" \
-  --visibility-output-dir "$VISIBILITY_OUTPUT_DIR" \
+  --sample-dir "$SAMPLE_DIR" \
+  --results-dir "$RESULTS_DIR" \
+  --visibility-sample-dir "$VISIBILITY_SAMPLE_DIR" \
+  --visibility-results-dir "$VISIBILITY_RESULTS_DIR" \
+  --visibility-output-dir "$OUTPUT_DIR" \
   --config-path "$CONFIG_PATH" \
-  --shuffle-partitions 1600 \
-  --coalesce 400 \
-  --tmpdir "$JOB_SCRATCH"
+  --tmpdir "$JOB_SCRATCH" \
+  --mode visibility
 
-echo "[CHECK] sample outputs:"
-find "$OUTPUT_DIR" -maxdepth 2 -type f | sort | head || true
-find "$OUTPUT_DIR" -maxdepth 2 -type f | wc -l || true
+echo "[CHECK] visibility table outputs:"
+find "$OUTPUT_DIR" -maxdepth 1 -type f | sort | head || true
+find "$OUTPUT_DIR" -maxdepth 1 -type f | wc -l || true
 
 echo "[INFO] Done."

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=evt_paocc_03
-#SBATCH --output=logs/evt_paocc_03_%j.out
-#SBATCH --error=logs/evt_paocc_03_%j.err
+#SBATCH --job-name=evt_paocc_06
+#SBATCH --output=logs/evt_paocc_06_%j.out
+#SBATCH --error=logs/evt_paocc_06_%j.err
 #SBATCH --time=02:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
@@ -13,8 +13,8 @@ PROJECT_ROOT="${PROJECT_ROOT:-/labs/khanna/predictive_capital/revelio_people_ana
 CODE_DIR="$PROJECT_ROOT/code"
 LOG_DIR="$PROJECT_ROOT/logs"
 CONFIG_PATH="${CONFIG_PATH:-$PROJECT_ROOT/configs/revelio_event_study_config.json}"
-RESULTS_DIR="${RESULTS_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/results}"
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/figures}"
+VISIBILITY_RESULTS_DIR="${VISIBILITY_RESULTS_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/visibility_results}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/visibility_figures}"
 SPARK_BASE_DIR="${SPARK_BASE_DIR:-/labs/khanna/predictive_capital/scratch/revelio_event_study/${USER}}"
 JOB_SCRATCH="$SPARK_BASE_DIR/${SLURM_JOB_ID}"
 
@@ -43,12 +43,12 @@ trap cleanup EXIT
 
 python -u "$CODE_DIR/plotting/03_make_event_study_figures.py" \
   --project-root "$PROJECT_ROOT" \
-  --results-dir "$RESULTS_DIR" \
-  --output-dir "$OUTPUT_DIR" \
+  --visibility-results-dir "$VISIBILITY_RESULTS_DIR" \
+  --visibility-output-dir "$OUTPUT_DIR" \
   --config-path "$CONFIG_PATH" \
-  --mode base
+  --mode visibility
 
-echo "[CHECK] figure outputs:"
+echo "[CHECK] visibility figure outputs:"
 find "$OUTPUT_DIR" -maxdepth 1 -type f | sort | head || true
 find "$OUTPUT_DIR" -maxdepth 1 -type f | wc -l || true
 

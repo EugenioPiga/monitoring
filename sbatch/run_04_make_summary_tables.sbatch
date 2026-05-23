@@ -1,51 +1,84 @@
-#!/bin/bash
-#SBATCH --job-name=revelio_evt_04
-#SBATCH --output=logs/revelio_evt_04_%j.out
-#SBATCH --error=logs/revelio_evt_04_%j.err
-#SBATCH --partition=general
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
+#!/usr/bin/env bash
+#SBATCH --job-name=evt_paocc_04
+#SBATCH --output=logs/evt_paocc_04_%j.out
+#SBATCH --error=logs/evt_paocc_04_%j.err
+#SBATCH --time=03:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=02:30:00
+#SBATCH --partition=general
 
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-/labs/khanna/predictive_capital/revelio_people_analytics}"
+CODE_DIR="$PROJECT_ROOT/code"
+LOG_DIR="$PROJECT_ROOT/logs"
 CONFIG_PATH="${CONFIG_PATH:-$PROJECT_ROOT/configs/revelio_event_study_config.json}"
-ANALYSIS_ROOT="${ANALYSIS_ROOT:-$PROJECT_ROOT/processed/analysis}"
-LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/logs}"
-CONDA_ENV="${CONDA_ENV:-revelio}"
-JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-11-openjdk}"
-SPARK_BASE_DIR="${SPARK_BASE_DIR:-/scratch/${USER}/revelio_event_study}"
-JOB_SCRATCH="${SPARK_BASE_DIR}/${SLURM_JOB_ID}_04_tables"
-SAMPLE_PATH="${SAMPLE_PATH:-$ANALYSIS_ROOT/samples/revelio_event_study_sample.parquet}"
-TABLE_DIR="${TABLE_DIR:-$ANALYSIS_ROOT/tables/event_study_summary}"
+SAMPLE_DIR="${SAMPLE_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/sample}"
+RESULTS_DIR="${RESULTS_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/results}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/tables}"
+VISIBILITY_SAMPLE_DIR="${VISIBILITY_SAMPLE_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/visibility_sample}"
+VISIBILITY_RESULTS_DIR="${VISIBILITY_RESULTS_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/visibility_results}"
+VISIBILITY_OUTPUT_DIR="${VISIBILITY_OUTPUT_DIR:-$PROJECT_ROOT/processed/final/event_studies_pa_posting_parent_occ_safe_v3/visibility_tables}"
+SPARK_BASE_DIR="${SPARK_BASE_DIR:-/labs/khanna/predictive_capital/scratch/revelio_event_study/${USER}}"
+JOB_SCRATCH="$SPARK_BASE_DIR/${SLURM_JOB_ID}"
 
-mkdir -p "$LOG_DIR" "$ANALYSIS_ROOT" "$JOB_SCRATCH" "$JOB_SCRATCH/spark_local"
-export JAVA_HOME
-export TMPDIR="$JOB_SCRATCH"
-export SPARK_LOCAL_DIRS="$JOB_SCRATCH/spark_local"
-export PYSPARK_PYTHON="${PYSPARK_PYTHON:-python}"
+mkdir -p "$LOG_DIR"
+cd "$PROJECT_ROOT"
+
+set +u
+source "$HOME/miniconda/bin/activate" revelio
+set -u
+echo "[INFO] Using python: $(which python)"
+python -V
+
+export JAVA_HOME="$HOME/jdk-17"
+export PATH="$JAVA_HOME/bin:$PATH"
+echo "[JAVA] Using $(java -version 2>&1 | head -n 1)"
+
+rm -rf "$JOB_SCRATCH" 2>/dev/null || true
+mkdir -p "$JOB_SCRATCH"/{tmp,local,warehouse}
+export TMPDIR="$JOB_SCRATCH/tmp"
+export SPARK_LOCAL_DIRS="$JOB_SCRATCH/local"
+
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export _JAVA_OPTIONS="-Djava.io.tmpdir=$TMPDIR -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:+ExitOnOutOfMemoryError"
+export SPARK_EVENTLOG_ENABLED="false"
+export PYTHONPATH="$CODE_DIR:${PYTHONPATH:-}"
+export PYSPARK_PYTHON="$(which python)"
+export PYSPARK_DRIVER_PYTHON="$(which python)"
+
+export PYSPARK_SUBMIT_ARGS="\
+--conf spark.driver.memory=20g \
+--conf spark.driver.maxResultSize=4g \
+--conf spark.sql.shuffle.partitions=400 \
+--conf spark.default.parallelism=400 \
+--conf spark.sql.files.maxPartitionBytes=134217728 \
+--conf spark.sql.adaptive.enabled=true \
+--conf spark.sql.adaptive.coalescePartitions.enabled=false \
+pyspark-shell"
 
 cleanup() {
-  rm -rf "$JOB_SCRATCH"
+  rm -rf "$JOB_SCRATCH" 2>/dev/null || true
 }
 trap cleanup EXIT
 
-if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
-  source "$HOME/miniconda3/etc/profile.d/conda.sh"
-elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
-  source "$HOME/anaconda3/etc/profile.d/conda.sh"
-else
-  echo "Unable to locate conda.sh" >&2
-  exit 1
-fi
-conda activate "$CONDA_ENV"
-
-cd "$PROJECT_ROOT"
-python code/analysis/04_make_summary_tables.py \
+python -u "$CODE_DIR/analysis/04_make_event_study_tables.py" \
   --project-root "$PROJECT_ROOT" \
+  --sample-dir "$SAMPLE_DIR" \
+  --results-dir "$RESULTS_DIR" \
+  --output-dir "$OUTPUT_DIR" \
+  --visibility-sample-dir "$VISIBILITY_SAMPLE_DIR" \
+  --visibility-results-dir "$VISIBILITY_RESULTS_DIR" \
+  --visibility-output-dir "$VISIBILITY_OUTPUT_DIR" \
   --config-path "$CONFIG_PATH" \
-  --sample-path "$SAMPLE_PATH" \
-  --output-dir "$TABLE_DIR"
+  --tmpdir "$JOB_SCRATCH" \
+  --mode base
+
+echo "[CHECK] table outputs:"
+find "$OUTPUT_DIR" -maxdepth 1 -type f | sort | head || true
+find "$OUTPUT_DIR" -maxdepth 1 -type f | wc -l || true
+
+echo "[INFO] Done."
