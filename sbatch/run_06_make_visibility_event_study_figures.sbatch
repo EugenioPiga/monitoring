@@ -6,6 +6,8 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --partition=general
+#SBATCH --mail-user=epiga@ucsd.edu
+#SBATCH --mail-type=BEGIN,END,FAIL,TIME_LIMIT
 
 set -euo pipefail
 
