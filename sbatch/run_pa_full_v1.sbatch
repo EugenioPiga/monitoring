@@ -9,5 +9,8 @@
 set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-/labs/khanna/predictive_capital/revelio_people_analytics}"
 CODE_DIR="$PROJECT_ROOT/code/analysis/pa_full_v1"
+# Conda activation can fail under nounset; relax -u temporarily
+set +u
 source "$HOME/miniconda/bin/activate" revelio || true
+set -u
 python -u "$CODE_DIR/run_all_pa_full_v1.py" --project-root "$PROJECT_ROOT"
