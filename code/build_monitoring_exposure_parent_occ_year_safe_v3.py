@@ -15,6 +15,7 @@ OUTCOME_COLS = [
     "skill_bundle_dispersion", "skill_hhi_mean", "specialist_share",
     "hr_to_employee_ratio", "managers_to_employee_ratio", "n_hr_positions", "n_managers",
     "n_promotions", "promotion_rate", "promotion_rate_continuers", "n_continuing_workers",
+    "avg_salary", "log_avg_salary", "F5_avg_salary", "L1_avg_salary", "d5_log_avg_salary",
 ]
 
 PARENT_YEAR_KEEP = [
@@ -74,6 +75,12 @@ def main():
         .select(*existing(parent_occ, keep))
         .cache()
     )
+    if "avg_salary" in poc.columns and "log_avg_salary" not in poc.columns:
+        poc = poc.withColumn(
+            "log_avg_salary",
+            F.when(F.col("avg_salary") > 0, F.log(F.col("avg_salary"))).otherwise(F.lit(None))
+        )
+
     _ = poc.count()
 
     # Add parent-year adoption intensities if the parent-occupation panel does not already carry them.
