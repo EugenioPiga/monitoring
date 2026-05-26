@@ -18,7 +18,10 @@ LOG_DIR="$PROJECT_ROOT/logs"
 mkdir -p "$LOG_DIR"
 cd "$PROJECT_ROOT"
 
-source "$HOME/miniconda/bin/activate" revelio
+# Conda activation can fail under nounset; relax -u temporarily
+set +u
+source "$HOME/miniconda/bin/activate" revelio || true
+set -u
 echo "[INFO] Using python: $(which python)"
 python -V
 
